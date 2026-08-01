@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-gauge.local/schemas/adapter-manifest-v1.schema.json",
+  "title": "Agent Gauge Adapter Manifest V1",
+  "type": "object",
+  "required": ["schema_version", "id", "name", "command"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "id": { "type": "string", "pattern": "^[a-z0-9-]{1,64}$" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+    "command": { "type": "string", "minLength": 1 },
+    "args": { "type": "array", "maxItems": 32, "items": { "type": "string", "maxLength": 2048 } },
+    "refresh_interval_seconds": { "type": "integer", "minimum": 60, "maximum": 86400 },
+    "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 30 },
+    "accent": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" }
+  }
+}
