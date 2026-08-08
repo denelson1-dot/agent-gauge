@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Agent Gauge",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "identifier": "io.theforge.agent-gauge",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -53,6 +53,14 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      },
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
   }
 }

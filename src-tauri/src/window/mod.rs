@@ -132,9 +132,26 @@ pub fn initialize_widget(app: &AppHandle) -> Result<(), String> {
         enforce_focus_policy(&window, state.locked)?;
     }
 
+    crate::platform::window::start_layer_watchdog(app);
+
     emit_state(app);
     persist_soon(app);
     Ok(())
+}
+
+/// Reports what the widget window is actually doing, for `--diagnose-window-layer`.
+pub fn diagnose_layer(app: &AppHandle) -> Result<String, String> {
+    let state = app.state::<ManagedWindowState>().snapshot();
+    let window = widget(app)?;
+    let layer = crate::platform::window::apply_layer(&window, state.mode)?;
+    Ok(format!(
+        "{}\nresolved-layer={}\nlocked={}  visible={}\ngeometry={:?}",
+        crate::platform::window::diagnose(&window, state.mode),
+        layer.describe(),
+        state.locked,
+        state.visible,
+        state.geometry,
+    ))
 }
 
 pub fn reassert_current_policy(app: &AppHandle) -> Result<(), String> {
@@ -273,7 +290,7 @@ pub fn set_widget_visible(app: &AppHandle, visible: bool) -> Result<(), String> 
         apply_window_policy(&window, &snapshot)?;
         show_widget(&window)?;
         if let Some(geometry) = app.state::<ManagedWindowState>().snapshot().geometry {
-            apply_geometry(&window, &geometry)?;
+            apply_geometry(&window, &geometry, snapshot.mode)?;
             stabilize_geometry_after_show(app, geometry);
         } else {
             app.state::<ManagedWindowState>()
@@ -328,6 +345,11 @@ pub fn capture_geometry(app: &AppHandle) {
         return;
     };
 
+    // Converted back into screen coordinates, the space geometry is stored and
+    // recovered in.
+    let (position_x, position_y) =
+        crate::platform::window::to_screen(snapshot.mode, position.x, position.y);
+
     let monitor = window.current_monitor().ok().flatten();
     let scale_factor = monitor
         .as_ref()
@@ -343,8 +365,8 @@ pub fn capture_geometry(app: &AppHandle) {
         .lock()
         .expect("window state mutex poisoned")
         .geometry = Some(Geometry {
-        x: position.x,
-        y: position.y,
+        x: position_x,
+        y: position_y,
         width: size.width,
         height: size.height,
         scale_factor,
@@ -505,24 +527,11 @@ fn apply_window_policy(window: &WebviewWindow, state: &WidgetState) -> Result<()
         .set_shadow(false)
         .map_err(|error| format!("could not remove window shadow: {error}"))?;
 
-    match state.mode {
-        DisplayMode::Desktop => {
-            window
-                .set_always_on_top(false)
-                .map_err(|error| format!("could not clear pinned state: {error}"))?;
-            window
-                .set_always_on_bottom(true)
-                .map_err(|error| format!("could not request desktop-below state: {error}"))?;
-        }
-        DisplayMode::Pinned => {
-            window
-                .set_always_on_bottom(false)
-                .map_err(|error| format!("could not clear desktop-below state: {error}"))?;
-            window
-                .set_always_on_top(true)
-                .map_err(|error| format!("could not request pinned-above state: {error}"))?;
-        }
-    }
+    // Layering is the one window property the two platforms cannot express the
+    // same way, so it lives behind `platform::window`. On Windows it may report
+    // a weaker layer than requested; that is a deliberate fallback rather than
+    // a failure, and the widget stays visible either way.
+    crate::platform::window::apply_layer(window, state.mode)?;
 
     window
         .set_resizable(!state.locked)
@@ -572,7 +581,8 @@ fn restore_geometry(app: &AppHandle, window: &WebviewWindow) -> Result<(), Strin
     let restored = recover_geometry(saved.as_ref(), &monitors, MIN_WIDTH, MIN_HEIGHT)
         .ok_or_else(|| "no monitor was available for geometry recovery".to_string())?;
 
-    apply_geometry(window, &restored)?;
+    let mode = app.state::<ManagedWindowState>().snapshot().mode;
+    apply_geometry(window, &restored, mode)?;
 
     app.state::<ManagedWindowState>()
         .value
@@ -582,12 +592,18 @@ fn restore_geometry(app: &AppHandle, window: &WebviewWindow) -> Result<(), Strin
     Ok(())
 }
 
-fn apply_geometry(window: &WebviewWindow, geometry: &Geometry) -> Result<(), String> {
+fn apply_geometry(
+    window: &WebviewWindow,
+    geometry: &Geometry,
+    mode: DisplayMode,
+) -> Result<(), String> {
     window
         .set_size(PhysicalSize::new(geometry.width, geometry.height))
         .map_err(|error| format!("could not restore widget size: {error}"))?;
+    // Saved geometry is in screen coordinates; see platform::window::to_native.
+    let (x, y) = crate::platform::window::to_native(mode, geometry.x, geometry.y);
     window
-        .set_position(PhysicalPosition::new(geometry.x, geometry.y))
+        .set_position(PhysicalPosition::new(x, y))
         .map_err(|error| format!("could not restore widget position: {error}"))
 }
 
@@ -598,7 +614,8 @@ fn stabilize_geometry_after_show(app: &AppHandle, geometry: Geometry) {
         let app_for_main = app.clone();
         let _ = app.run_on_main_thread(move || {
             if let Ok(window) = widget(&app_for_main) {
-                let _ = apply_geometry(&window, &geometry);
+                let mode = app_for_main.state::<ManagedWindowState>().snapshot().mode;
+                let _ = apply_geometry(&window, &geometry, mode);
             }
         });
         thread::sleep(Duration::from_millis(180));

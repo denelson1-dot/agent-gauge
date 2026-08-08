@@ -4,9 +4,11 @@ use serde::Deserialize;
 use tauri::{AppHandle, Emitter, Manager, Window};
 
 use crate::{
-    adapters, autostart,
+    adapters,
     model::{ActionResult, AppAggregate, DiagnosticPaths, Theme, SETTINGS_SCHEMA_VERSION},
-    paths, providers,
+    paths,
+    platform::autostart,
+    providers,
     settings::SettingsStore,
     window::{self, DisplayMode, ManagedWindowState},
 };
@@ -173,13 +175,29 @@ pub fn aggregate(app: &AppHandle, surface: &str) -> AppAggregate {
             .position(|id| id == &provider.id)
             .unwrap_or(usize::MAX)
     });
+    let window = app.state::<ManagedWindowState>().snapshot();
+
+    // The widget surface renders from this rather than from `providers`, so
+    // that the React and Cairo painters cannot disagree about what the numbers
+    // mean. `providers` remains for the settings surface, which needs the raw
+    // connection detail.
+    let widget_view = crate::render::widget_view(
+        settings.theme,
+        &settings.provider_order,
+        &settings.disabled_providers,
+        providers.clone(),
+        &window,
+        providers::now_unix(),
+    );
+
     AppAggregate {
         schema_version: SETTINGS_SCHEMA_VERSION,
         surface: surface.into(),
         app_version: env!("CARGO_PKG_VERSION").into(),
         settings,
-        window: app.state::<ManagedWindowState>().snapshot(),
+        window,
         providers,
+        widget_view,
         adapters: adapters::list(app),
         claude_capture: providers::read_capture_status(),
         autostart_enabled: autostart::enabled(),
