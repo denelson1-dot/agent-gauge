@@ -1,7 +1,8 @@
 use tauri::{menu::MenuBuilder, tray::TrayIconBuilder, AppHandle};
 
 use crate::{
-    autostart, providers,
+    platform::autostart,
+    providers,
     window::{self, DisplayMode},
 };
 
@@ -34,6 +35,10 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
 
     let mut builder = TrayIconBuilder::with_id("agent-gauge")
         .menu(&menu)
+        // The tray menu is the only way to reach Agent Gauge when the widget is
+        // hidden or locked, so it has to open on the click people actually try.
+        // Windows convention is a left click; the default only opens on right.
+        .show_menu_on_left_click(true)
         .tooltip("Agent Gauge")
         .on_menu_event(|app, event| {
             let result = match event.id().as_ref() {

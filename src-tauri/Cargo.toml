@@ -1,7 +1,7 @@
 [package]
 name = "agent-gauge"
-version = "0.1.4"
-description = "A local AI subscription usage widget for Cinnamon/X11"
+version = "0.2.0"
+description = "A local AI subscription usage widget for Linux and Windows"
 authors = ["Dave"]
 edition = "2021"
 license = "MIT"
@@ -28,4 +28,17 @@ sha2 = "0.10"
 hex = "0.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# The widget surface is drawn directly with GTK/Cairo on Linux; see
+# platform::widget for why the webview is not used there.
 gtk = "0.18"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Start-at-login is a value under the per-user Run key.
+winreg = "0.52"
+# Desktop mode reparents the widget into Explorer's wallpaper window, which has
+# no equivalent in the cross-platform window API.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }

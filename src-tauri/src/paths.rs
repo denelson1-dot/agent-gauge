@@ -1,58 +1,32 @@
-use std::{
-    env, fs,
-    path::{Path, PathBuf},
-};
+//! Where Agent Gauge keeps its files.
+//!
+//! The base directories are platform-specific and resolved in
+//! `platform::dirs`; this module re-exports them and derives the individual
+//! paths built on top. Keeping the derived paths here means the rest of the
+//! crate asks for a *purpose* ("the adapters directory") rather than assembling
+//! a layout, and only one file changes if a layout ever moves.
 
-const APP_DIR: &str = "agent-gauge";
+use std::path::PathBuf;
 
-pub fn config_dir() -> PathBuf {
-    xdg_dir("XDG_CONFIG_HOME", ".config").join(APP_DIR)
-}
-
-pub fn cache_dir() -> PathBuf {
-    xdg_dir("XDG_CACHE_HOME", ".cache").join(APP_DIR)
-}
-
-pub fn state_dir() -> PathBuf {
-    xdg_dir("XDG_STATE_HOME", ".local/state").join(APP_DIR)
-}
+pub use crate::platform::dirs::{cache_dir, config_dir, ensure_parent, home_dir, state_dir};
 
 pub fn adapters_dir() -> PathBuf {
     config_dir().join("adapters")
 }
 
+/// Claude Code's own settings file.
+///
+/// Anchored to the home directory rather than to `config_dir` because Claude
+/// Code uses `~/.claude` on every platform, including Windows, where Agent
+/// Gauge's own configuration lives under `%APPDATA%` instead.
 pub fn claude_settings_path() -> PathBuf {
-    home_dir().join(".claude/settings.json")
+    home_dir().join(".claude").join("settings.json")
 }
 
-pub fn claude_dispatcher_path() -> PathBuf {
+/// The generated Python status-line dispatcher.
+///
+/// Retained only so existing installations can be migrated off it; nothing
+/// writes this file any more. See `providers::claude`.
+pub fn legacy_claude_dispatcher_path() -> PathBuf {
     config_dir().join("claude-status-dispatcher.py")
-}
-
-pub fn autostart_path() -> PathBuf {
-    xdg_dir("XDG_CONFIG_HOME", ".config")
-        .join("autostart")
-        .join("io.theforge.agent-gauge.desktop")
-}
-
-pub fn ensure_parent(path: &Path) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("could not create {}: {error}", parent.display()))
-}
-
-fn xdg_dir(variable: &str, fallback: &str) -> PathBuf {
-    env::var_os(variable)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(fallback))
-}
-
-fn home_dir() -> PathBuf {
-    env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
 }
