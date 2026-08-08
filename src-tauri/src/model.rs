@@ -77,6 +77,25 @@ pub struct UsageWindow {
     pub display: WindowDisplay,
 }
 
+impl UsageWindow {
+    /// A window whose reported reset time has passed has rolled over. The
+    /// captured percent describes the window that ended, so it no longer
+    /// describes current usage even when the provider has gone quiet.
+    pub fn rolled_over(&self, now: i64) -> bool {
+        self.resets_at.is_some_and(|resets_at| now >= resets_at)
+    }
+
+    /// Usage to present. A rolled-over window starts empty; that is derived
+    /// from the provider's own reset time rather than invented.
+    pub fn effective_used_percent(&self, now: i64) -> f64 {
+        if self.rolled_over(now) {
+            0.0
+        } else {
+            self.used_percent
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Balance {
     pub id: String,
@@ -165,7 +184,11 @@ pub struct AppAggregate {
     pub app_version: String,
     pub settings: AppSettings,
     pub window: WidgetState,
+    /// Raw provider state, used by the settings surface.
     pub providers: Vec<ProviderSnapshot>,
+    /// What the widget should display. Derived once in `render` so that both
+    /// painters — Cairo on Linux, React on Windows — show the same thing.
+    pub widget_view: crate::render::WidgetView,
     pub adapters: Vec<AdapterInfo>,
     pub claude_capture: ClaudeCaptureStatus,
     pub autostart_enabled: bool,
@@ -177,4 +200,41 @@ pub struct ActionResult {
     pub ok: bool,
     pub code: String,
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(resets_at: Option<i64>) -> UsageWindow {
+        UsageWindow {
+            id: "five-hour".into(),
+            label: "5 hour".into(),
+            used_percent: 87.0,
+            resets_at,
+            window_minutes: Some(300),
+            display: WindowDisplay::Ring,
+        }
+    }
+
+    #[test]
+    fn live_window_reports_captured_usage() {
+        let window = window(Some(2_000));
+        assert!(!window.rolled_over(1_000));
+        assert_eq!(window.effective_used_percent(1_000), 87.0);
+    }
+
+    #[test]
+    fn expired_window_reports_empty_usage_and_unknown_reset() {
+        let window = window(Some(2_000));
+        assert!(window.rolled_over(2_000));
+        assert_eq!(window.effective_used_percent(2_000), 0.0);
+    }
+
+    #[test]
+    fn window_without_a_reset_time_keeps_captured_usage() {
+        let window = window(None);
+        assert!(!window.rolled_over(9_999));
+        assert_eq!(window.effective_used_percent(9_999), 87.0);
+    }
 }

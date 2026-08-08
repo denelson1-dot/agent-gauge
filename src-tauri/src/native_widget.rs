@@ -12,10 +12,11 @@ mod linux {
     use tauri::{AppHandle, Manager, WebviewWindow};
 
     use crate::{
-        model::{ConnectionState, ProviderSnapshot, Theme, UsageWindow, WindowDisplay},
+        model::{Theme, WindowDisplay},
         providers::ProviderStore,
+        render::{self, ProviderView, WidgetView, WindowView},
         settings::SettingsStore,
-        window::{DisplayMode, ManagedWindowState, WIDGET_LABEL},
+        window::{ManagedWindowState, WIDGET_LABEL},
     };
 
     type Color = (f64, f64, f64, f64);
@@ -139,9 +140,18 @@ mod linux {
             return;
         }
 
+        // Every decision about what the widget says is made in `render`, which
+        // the Windows renderer reads too. This function only paints.
         let settings = app.state::<SettingsStore>().snapshot();
-        let window = app.state::<ManagedWindowState>().snapshot();
-        let colors = palette(settings.theme);
+        let view = render::widget_view(
+            settings.theme,
+            &settings.provider_order,
+            &settings.disabled_providers,
+            app.state::<ProviderStore>().snapshots(),
+            &app.state::<ManagedWindowState>().snapshot(),
+            crate::providers::now_unix(),
+        );
+        let colors = palette(view.theme);
 
         context.set_operator(Operator::Source);
         context.set_source_rgba(0.0, 0.0, 0.0, 0.0);
@@ -153,15 +163,15 @@ mod linux {
         let _ = context.fill_preserve();
         rgba(
             context,
-            if window.locked {
+            if view.locked {
                 colors.line
             } else {
                 colors.accent
             },
         );
-        context.set_line_width(if window.locked { 1.0 } else { 2.0 });
+        context.set_line_width(if view.locked { 1.0 } else { 2.0 });
         let _ = context.stroke();
-        if !window.locked {
+        if !view.locked {
             draw_editing_handles(context, width, height, colors.accent);
         }
 
@@ -176,11 +186,7 @@ mod linux {
         );
         label_right(
             context,
-            if window.mode == DisplayMode::Pinned {
-                "PINNED"
-            } else {
-                "DESKTOP"
-            },
+            &view.mode_label,
             width - 26.0,
             33.0,
             10.5,
@@ -188,29 +194,8 @@ mod linux {
             colors.faint,
         );
 
-        let mut providers: Vec<_> = app
-            .state::<ProviderStore>()
-            .snapshots()
-            .into_iter()
-            .filter(|provider| {
-                provider.state != ConnectionState::Disabled
-                    && provider.state != ConnectionState::Untrusted
-                    && !settings
-                        .disabled_providers
-                        .iter()
-                        .any(|id| id == &provider.id)
-            })
-            .collect();
-        providers.sort_by_key(|provider| {
-            settings
-                .provider_order
-                .iter()
-                .position(|id| id == &provider.id)
-                .unwrap_or(usize::MAX)
-        });
-
-        draw_provider_grid(context, &providers, width, height, colors);
-        if !window.locked {
+        draw_provider_grid(context, &view, width, height, colors);
+        if !view.locked {
             label_center(
                 context,
                 "LAYOUT UNLOCKED · DRAG OR RESIZE",
@@ -225,15 +210,15 @@ mod linux {
 
     fn draw_provider_grid(
         context: &Context,
-        providers: &[ProviderSnapshot],
+        view: &WidgetView,
         width: f64,
         height: f64,
         colors: Palette,
     ) {
-        if providers.is_empty() {
+        if let Some(empty) = &view.empty {
             label_center(
                 context,
-                "No trackers enabled",
+                &empty.title,
                 width / 2.0,
                 height / 2.0,
                 13.0,
@@ -242,7 +227,7 @@ mod linux {
             );
             label_center(
                 context,
-                "Open Settings from the tray",
+                &empty.detail,
                 width / 2.0,
                 height / 2.0 + 19.0,
                 9.0,
@@ -251,6 +236,7 @@ mod linux {
             );
             return;
         }
+        let providers = &view.providers;
 
         let x = 20.0;
         let y = 47.0;
@@ -326,7 +312,7 @@ mod linux {
         }
     }
 
-    fn provider_desired_height(provider: &ProviderSnapshot, scale: f64) -> f64 {
+    fn provider_desired_height(provider: &ProviderView, scale: f64) -> f64 {
         if provider.windows.is_empty() {
             return 112.0 * scale;
         }
@@ -344,10 +330,10 @@ mod linux {
             .iter()
             .filter(|window| window.display == WindowDisplay::Bar)
             .count() as f64;
-        let balance_height = if provider.balances.iter().any(|balance| balance.known) {
-            29.0
-        } else {
+        let balance_height = if provider.balances.is_empty() {
             0.0
+        } else {
+            29.0
         };
         (54.0 + ring_height + bars * 44.0 + balance_height) * scale
     }
@@ -355,7 +341,7 @@ mod linux {
     #[allow(clippy::too_many_arguments)]
     fn draw_provider(
         context: &Context,
-        provider: &ProviderSnapshot,
+        provider: &ProviderView,
         x: f64,
         y: f64,
         width: f64,
@@ -397,22 +383,22 @@ mod linux {
         );
         label_right(
             context,
-            provider_status(provider),
+            &provider.status_label,
             x + width - 14.0 * scale,
             y + 23.5 * scale,
             9.5 * text_scale,
             FontWeight::Normal,
-            if provider.error_code.is_some() {
+            if provider.warning.is_some() {
                 colors.error
             } else {
                 colors.muted
             },
         );
 
-        if provider.windows.is_empty() {
+        if let Some(notice) = &provider.notice {
             label(
                 context,
-                &provider.status_message,
+                &notice.title,
                 x + 16.0 * scale,
                 y + 62.0 * scale,
                 12.0 * text_scale,
@@ -421,11 +407,7 @@ mod linux {
             );
             label_wrapped(
                 context,
-                if provider.id == "claude" {
-                    "Connect capture in Settings, then use Claude Code normally."
-                } else {
-                    "Open Settings for connection details."
-                },
+                &notice.detail,
                 x + 16.0 * scale,
                 y + 83.0 * scale,
                 width - 32.0 * scale,
@@ -444,7 +426,7 @@ mod linux {
             .iter()
             .filter(|window| window.display == WindowDisplay::Bar)
             .collect();
-        let has_balance = provider.balances.iter().any(|balance| balance.known);
+        let has_balance = !provider.balances.is_empty();
         let ring_block = if ring.is_some() { 82.0 * scale } else { 0.0 };
         let bar_block = bars.len() as f64 * 44.0 * scale;
         let balance_block = if has_balance { 29.0 * scale } else { 0.0 };
@@ -472,7 +454,7 @@ mod linux {
             );
             label(
                 context,
-                &reset_relative(ring.resets_at),
+                &ring.primary,
                 copy_x,
                 center_y + 1.0 * scale,
                 12.0 * text_scale,
@@ -481,7 +463,7 @@ mod linux {
             );
             label(
                 context,
-                &reset_absolute(ring.resets_at),
+                &ring.secondary,
                 copy_x,
                 center_y + 20.0 * scale,
                 9.5 * text_scale,
@@ -505,13 +487,8 @@ mod linux {
             cursor += 44.0 * scale;
         }
 
-        if let Some(balance) = provider.balances.iter().find(|balance| balance.known) {
-            let amount = match (&balance.amount, balance.unit.as_deref()) {
-                (Some(amount), Some("USD")) => format!("${amount}"),
-                (Some(amount), Some(unit)) => format!("{amount} {unit}"),
-                (Some(amount), None) => amount.clone(),
-                _ => "—".into(),
-            };
+        if let Some(balance) = provider.balances.first() {
+            let amount = &balance.amount;
             context.move_to(x + 16.0 * scale, cursor + 4.0 * scale);
             context.line_to(x + width - 16.0 * scale, cursor + 4.0 * scale);
             rgba(context, colors.line);
@@ -528,7 +505,7 @@ mod linux {
             );
             label_right(
                 context,
-                &amount,
+                amount,
                 x + width - 16.0 * scale,
                 cursor + 22.0 * scale,
                 10.5 * text_scale,
@@ -541,7 +518,7 @@ mod linux {
     #[allow(clippy::too_many_arguments)]
     fn draw_ring(
         context: &Context,
-        window: &UsageWindow,
+        window: &WindowView,
         x: f64,
         y: f64,
         radius: f64,
@@ -561,7 +538,7 @@ mod linux {
             y,
             radius,
             -PI / 2.0,
-            -PI / 2.0 + PI * 2.0 * window.used_percent.clamp(0.0, 100.0) / 100.0,
+            -PI / 2.0 + PI * 2.0 * window.fill / 100.0,
         );
         rgba(context, accent);
         context.set_line_cap(LineCap::Round);
@@ -569,7 +546,7 @@ mod linux {
         context.set_line_cap(LineCap::Butt);
         label_center(
             context,
-            &percent(window.used_percent),
+            &window.percent_label,
             x,
             y + 2.0 * scale,
             15.0 * text_scale,
@@ -590,7 +567,7 @@ mod linux {
     #[allow(clippy::too_many_arguments)]
     fn draw_bar(
         context: &Context,
-        window: &UsageWindow,
+        window: &WindowView,
         x: f64,
         y: f64,
         width: f64,
@@ -610,7 +587,7 @@ mod linux {
         );
         label_right(
             context,
-            &format!("{} used", percent(window.used_percent)),
+            &format!("{} used", window.percent_label),
             x + width,
             y,
             10.0 * text_scale,
@@ -631,7 +608,7 @@ mod linux {
             context,
             x,
             y + 11.0 * scale,
-            width * window.used_percent.clamp(0.0, 100.0) / 100.0,
+            width * window.fill / 100.0,
             8.0 * scale,
             4.0 * scale,
         );
@@ -639,40 +616,13 @@ mod linux {
         let _ = context.fill();
         label(
             context,
-            &format!(
-                "{} · {}",
-                reset_relative(window.resets_at),
-                reset_absolute(window.resets_at)
-            ),
+            &format!("{} · {}", window.primary, window.secondary),
             x,
             y + 31.0 * scale,
             9.0 * text_scale,
             FontWeight::Normal,
             colors.faint,
         );
-    }
-
-    fn provider_status(provider: &ProviderSnapshot) -> &'static str {
-        if provider.refreshing {
-            return "Refreshing";
-        }
-        match provider.state {
-            ConnectionState::Connected => {
-                if provider
-                    .observed_at
-                    .is_some_and(|observed| crate::providers::now_unix() - observed > 1_800)
-                {
-                    "Stale"
-                } else {
-                    "Connected"
-                }
-            }
-            ConnectionState::Waiting => "Waiting",
-            ConnectionState::Disconnected => "Disconnected",
-            ConnectionState::Error => "Error",
-            ConnectionState::Disabled => "Disabled",
-            ConnectionState::Untrusted => "Untrusted",
-        }
     }
 
     fn resize_edge(x: f64, y: f64, width: i32, height: i32) -> Option<gdk::WindowEdge> {
@@ -749,43 +699,6 @@ mod linux {
                 accent: (0.86, 0.86, 0.83, 1.0),
                 error: (0.96, 0.62, 0.57, 1.0),
             },
-        }
-    }
-
-    fn reset_relative(timestamp: Option<i64>) -> String {
-        let Some(timestamp) = timestamp else {
-            return "Reset unavailable".into();
-        };
-        let seconds = timestamp - crate::providers::now_unix();
-        if seconds <= 0 {
-            return "Reset due".into();
-        }
-        let minutes = (seconds + 59) / 60;
-        if minutes < 60 {
-            format!("Resets in {minutes}m")
-        } else if minutes < 2_880 {
-            format!("Resets in {}h {}m", minutes / 60, minutes % 60)
-        } else {
-            format!("Resets in {}d {}h", minutes / 1_440, (minutes % 1_440) / 60)
-        }
-    }
-
-    fn reset_absolute(timestamp: Option<i64>) -> String {
-        timestamp
-            .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0))
-            .map(|utc| {
-                utc.with_timezone(&chrono::Local)
-                    .format("%a %-I:%M %p")
-                    .to_string()
-            })
-            .unwrap_or_else(|| "Time unavailable".into())
-    }
-
-    fn percent(value: f64) -> String {
-        if value.fract().abs() < 0.05 {
-            format!("{value:.0}%")
-        } else {
-            format!("{value:.1}%")
         }
     }
 

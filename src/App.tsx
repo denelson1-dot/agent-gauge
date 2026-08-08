@@ -77,6 +77,50 @@ type Adapter = {
   diagnostic: string | null;
 };
 
+// The widget's presentation model, decided entirely in src-tauri/src/render.rs.
+//
+// Agent Gauge paints the widget with GTK/Cairo on Linux and with React here on
+// Windows. Two painters is fine; two sets of rules is not. Everything below is
+// already formatted, already rolled over, already ordered — these components
+// draw what they are given and must not re-derive any of it. Reintroducing a
+// calculation here is how the two platforms start disagreeing.
+type Notice = { title: string; detail: string };
+
+type WindowView = {
+  id: string;
+  label: string;
+  display: "ring" | "bar";
+  /** 0-100, already clamped and rolled over. Use for geometry. */
+  fill: number;
+  percent_label: string;
+  primary: string;
+  secondary: string;
+};
+
+type BalanceView = { id: string; label: string; amount: string };
+
+type ProviderView = {
+  id: string;
+  name: string;
+  accent: string | null;
+  status_label: string;
+  tone: "fresh" | "stale" | "waiting" | "error";
+  refreshing: boolean;
+  notice: Notice | null;
+  windows: WindowView[];
+  balances: BalanceView[];
+  warning: string | null;
+};
+
+type WidgetView = {
+  theme: Theme;
+  mode: DisplayMode;
+  locked: boolean;
+  mode_label: string;
+  empty: Notice | null;
+  providers: ProviderView[];
+};
+
 type Aggregate = {
   schema_version: number;
   surface: string;
@@ -84,6 +128,7 @@ type Aggregate = {
   settings: Settings;
   window: WindowState;
   providers: Provider[];
+  widget_view: WidgetView;
   adapters: Adapter[];
   claude_capture: {
     state: "not_installed" | "installed" | "conflict" | "settings_invalid";
@@ -110,7 +155,6 @@ const resizeEdges = [
 function App() {
   const [app, setApp] = useState<Aggregate | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
 
   const reload = useCallback(async () => {
     try {
@@ -123,26 +167,23 @@ function App() {
 
   useEffect(() => {
     void reload();
+
+    // Every change reloads the whole aggregate rather than patching pieces of
+    // it. The widget renders from `widget_view`, which the backend derives from
+    // settings, window state and providers together — so patching one of those
+    // in isolation would leave the view describing a state that no longer
+    // exists. These events are infrequent; a consistent snapshot is worth more
+    // than the saved round-trip.
     const unlisteners = [
-      listen<Provider[]>("providers-changed", (event) =>
-        setApp((current) => (current ? { ...current, providers: orderProviders(event.payload, current.settings) } : current)),
-      ),
-      listen<Settings>("settings-changed", (event) =>
-        setApp((current) =>
-          current
-            ? {
-                ...current,
-                settings: event.payload,
-                providers: orderProviders(current.providers, event.payload),
-              }
-            : current,
-        ),
-      ),
-      listen<WindowState>("widget-state", (event) =>
-        setApp((current) => (current ? { ...current, window: event.payload } : current)),
-      ),
+      listen("providers-changed", () => void reload()),
+      listen("settings-changed", () => void reload()),
+      listen("widget-state", () => void reload()),
     ];
-    const tick = window.setInterval(() => setNow(Math.floor(Date.now() / 1000)), 30_000);
+
+    // Reset countdowns are rendered by the backend, so they go stale until the
+    // next aggregate arrives. This matches the Cairo renderer's own 30-second
+    // redraw, keeping both painters on the same cadence.
+    const tick = window.setInterval(() => void reload(), 30_000);
     return () => {
       window.clearInterval(tick);
       for (const unlisten of unlisteners) void unlisten.then((dispose) => dispose());
@@ -161,67 +202,60 @@ function App() {
   return app.surface === "settings" ? (
     <SettingsView app={app} reload={reload} setError={setError} />
   ) : (
-    <Widget app={app} now={now} error={error} setError={setError} />
+    <Widget app={app} error={error} setError={setError} />
   );
 }
 
 function Widget({
   app,
-  now,
   error,
   setError,
 }: {
   app: Aggregate;
-  now: number;
   error: string | null;
   setError: (message: string | null) => void;
 }) {
-  const providers = app.providers.filter(
-    (provider) =>
-      provider.state !== "disabled" &&
-      provider.state !== "untrusted" &&
-      !app.settings.disabled_providers.includes(provider.id),
-  );
+  const view = app.widget_view;
 
   function startDrag(event: MouseEvent<HTMLElement>) {
-    if (event.button !== 0 || app.window.locked) return;
+    if (event.button !== 0 || view.locked) return;
     event.preventDefault();
     void invoke("begin_drag").catch((reason) => setError(String(reason)));
   }
 
   function startResize(edge: (typeof resizeEdges)[number], event: MouseEvent<HTMLDivElement>) {
-    if (event.button !== 0 || app.window.locked) return;
+    if (event.button !== 0 || view.locked) return;
     event.preventDefault();
     event.stopPropagation();
     void invoke("begin_resize", { edge }).catch((reason) => setError(String(reason)));
   }
 
   return (
-    <main className={`widget ${app.window.locked ? "" : "widget--unlocked"}`} onMouseDown={startDrag}>
+    <main className={`widget ${view.locked ? "" : "widget--unlocked"}`} onMouseDown={startDrag}>
       <section className="widget__surface">
         <header className="widget__topline">
           <span className="wordmark">AGENT GAUGE</span>
-          <span className="widget__mode">{app.window.mode === "pinned" ? "PINNED" : "DESKTOP"}</span>
+          <span className="widget__mode">{view.mode_label}</span>
         </header>
 
         <div className="provider-grid">
-          {providers.length ? (
-            providers.map((provider) => <ProviderCard key={provider.id} provider={provider} now={now} />)
-          ) : (
+          {view.empty ? (
             <div className="empty-state">
-              <strong>No trackers enabled</strong>
-              <span>Open Settings from the tray to choose providers.</span>
+              <strong>{view.empty.title}</strong>
+              <span>{view.empty.detail}</span>
             </div>
+          ) : (
+            view.providers.map((provider) => <ProviderCard key={provider.id} provider={provider} />)
           )}
         </div>
 
-        {!app.window.locked ? (
+        {!view.locked ? (
           <div className="editing-note">Layout unlocked · drag anywhere · resize at the edges</div>
         ) : null}
         {error ? <div className="widget-error">{error}</div> : null}
       </section>
 
-      {!app.window.locked
+      {!view.locked
         ? resizeEdges.map((edge) => (
             <div
               aria-hidden="true"
@@ -235,13 +269,12 @@ function Widget({
   );
 }
 
-function ProviderCard({ provider, now }: { provider: Provider; now: number }) {
-  const freshness = freshnessFor(provider, now);
+function ProviderCard({ provider }: { provider: ProviderView }) {
   const ring = provider.windows.find((window) => window.display === "ring");
   const bars = provider.windows.filter((window) => window.display === "bar");
   return (
     <article
-      className={`provider-card provider-card--${freshness.tone} ${provider.refreshing ? "provider-card--refreshing" : ""}`}
+      className={`provider-card provider-card--${provider.tone} ${provider.refreshing ? "provider-card--refreshing" : ""}`}
       style={{ "--provider-accent": provider.accent ?? "var(--accent)" } as React.CSSProperties}
     >
       <header className="provider-card__header">
@@ -249,30 +282,35 @@ function ProviderCard({ provider, now }: { provider: Provider; now: number }) {
           <span className="provider-dot" />
           <strong>{provider.name}</strong>
         </div>
-        <span className="freshness"><span className="freshness__glyph">{freshness.glyph}</span>{freshness.label}</span>
+        <span className="freshness">
+          <span className="freshness__glyph">{toneGlyph(provider.tone)}</span>
+          {provider.status_label}
+        </span>
       </header>
 
-      {ring ? <RingMetric window={ring} now={now} /> : provider.windows.length ? null : <ConnectionMessage provider={provider} />}
-      {bars.map((window) => <BarMetric key={window.id} window={window} now={now} />)}
+      {ring ? <RingMetric window={ring} /> : null}
+      {provider.notice ? <ConnectionMessage notice={provider.notice} tone={provider.tone} /> : null}
+      {bars.map((window) => (
+        <BarMetric key={window.id} window={window} />
+      ))}
 
-      {provider.balances.filter((balance) => balance.known).map((balance) => (
+      {provider.balances.map((balance) => (
         <div className="balance-row" key={balance.id}>
           <span>{balance.label}</span>
-          <strong>{formatBalance(balance)}</strong>
+          <strong>{balance.amount}</strong>
         </div>
       ))}
 
-      {provider.error_code ? <div className="provider-warning">{provider.status_message}</div> : null}
+      {provider.warning ? <div className="provider-warning">{provider.warning}</div> : null}
     </article>
   );
 }
 
-function RingMetric({ window, now }: { window: UsageWindow; now: number }) {
-  const used = clamp(window.used_percent);
+function RingMetric({ window }: { window: WindowView }) {
   const circumference = 2 * Math.PI * 34;
   return (
     <div className="ring-metric">
-      <div className="usage-ring" aria-label={`${formatPercent(window.used_percent)} used`}>
+      <div className="usage-ring" aria-label={`${window.percent_label} used`}>
         <svg viewBox="0 0 80 80" role="img">
           <circle className="usage-ring__track" cx="40" cy="40" r="34" />
           <circle
@@ -281,35 +319,55 @@ function RingMetric({ window, now }: { window: UsageWindow; now: number }) {
             cy="40"
             r="34"
             strokeDasharray={circumference}
-            strokeDashoffset={circumference * (1 - used / 100)}
+            strokeDashoffset={circumference * (1 - window.fill / 100)}
           />
         </svg>
-        <div className="usage-ring__value"><strong>{formatPercent(window.used_percent)}</strong><span>used</span></div>
+        <div className="usage-ring__value">
+          <strong>{window.percent_label}</strong>
+          <span>used</span>
+        </div>
       </div>
       <div className="metric-copy">
         <span className="metric-label">{window.label}</span>
-        <strong>{formatReset(window.resets_at, now)}</strong>
-        <span>{formatAbsolute(window.resets_at)}</span>
+        <strong>{window.primary}</strong>
+        <span>{window.secondary}</span>
       </div>
     </div>
   );
 }
 
-function BarMetric({ window, now }: { window: UsageWindow; now: number }) {
+function BarMetric({ window }: { window: WindowView }) {
   return (
     <div className="bar-metric">
-      <div className="bar-metric__labels"><span>{window.label}</span><strong>{formatPercent(window.used_percent)} used</strong></div>
-      <div className="usage-bar"><span style={{ width: `${clamp(window.used_percent)}%` }} /></div>
-      <div className="bar-metric__reset">{formatReset(window.resets_at, now)} · {formatAbsolute(window.resets_at)}</div>
+      <div className="bar-metric__labels">
+        <span>{window.label}</span>
+        <strong>{window.percent_label} used</strong>
+      </div>
+      <div className="usage-bar">
+        <span style={{ width: `${window.fill}%` }} />
+      </div>
+      <div className="bar-metric__reset">
+        {window.primary} · {window.secondary}
+      </div>
     </div>
   );
 }
 
-function ConnectionMessage({ provider }: { provider: Provider }) {
+function toneGlyph(tone: ProviderView["tone"]) {
+  if (tone === "error") return "!";
+  if (tone === "waiting") return "○";
+  if (tone === "stale") return "△";
+  return "●";
+}
+
+function ConnectionMessage({ notice, tone }: { notice: Notice; tone: ProviderView["tone"] }) {
   return (
     <div className="connection-message">
-      <span>{provider.state === "waiting" ? "○" : provider.state === "untrusted" ? "◇" : "!"}</span>
-      <div><strong>{provider.status_message}</strong><small>{provider.id === "claude" ? "Use Claude Code normally after connecting capture." : "Open Settings for diagnostics."}</small></div>
+      <span>{toneGlyph(tone)}</span>
+      <div>
+        <strong>{notice.title}</strong>
+        <small>{notice.detail}</small>
+      </div>
     </div>
   );
 }
@@ -544,15 +602,6 @@ function Switch({ checked, onChange, label }: { checked: boolean; onChange: (val
   return <label className="switch"><input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} aria-label={label} /><span /></label>;
 }
 
-function freshnessFor(provider: Provider, now: number) {
-  if (provider.state === "error" || provider.state === "disconnected") return { tone: "error", glyph: "!", label: provider.state === "error" ? "Error" : "Disconnected" };
-  if (provider.state === "waiting" || provider.state === "untrusted") return { tone: "waiting", glyph: "○", label: provider.state === "untrusted" ? "Untrusted" : "Waiting" };
-  if (!provider.observed_at) return { tone: "waiting", glyph: "○", label: "Waiting" };
-  const age = now - provider.observed_at;
-  if (age > 1800) return { tone: "stale", glyph: "△", label: "Stale" };
-  if (age > 600) return { tone: "aging", glyph: "·", label: "Updated " + relativeAge(age) };
-  return { tone: "fresh", glyph: "●", label: "Updated " + relativeAge(age) };
-}
 
 function orderProviders(providers: Provider[], settings: Settings) {
   return [...providers].sort((left, right) => {
@@ -562,40 +611,11 @@ function orderProviders(providers: Provider[], settings: Settings) {
   });
 }
 
-function formatReset(timestamp: number | null, now: number) {
-  if (!timestamp) return "Reset unavailable";
-  const seconds = timestamp - now;
-  if (seconds <= 0) return "Reset due";
-  const minutes = Math.ceil(seconds / 60);
-  if (minutes < 60) return `Resets in ${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  const remainder = minutes % 60;
-  if (hours < 48) return `Resets in ${hours}h${remainder ? ` ${remainder}m` : ""}`;
-  return `Resets in ${Math.floor(hours / 24)}d ${hours % 24}h`;
-}
 
-function formatAbsolute(timestamp: number | null) {
-  if (!timestamp) return "Time unavailable";
-  return new Intl.DateTimeFormat(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" }).format(new Date(timestamp * 1000));
-}
 
-function relativeAge(seconds: number) {
-  if (seconds < 60) return "now";
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
-  return `${Math.floor(seconds / 3600)}h ago`;
-}
 
-function formatBalance(balance: Balance) {
-  if (!balance.known || balance.amount === null) return "—";
-  if (balance.unit === "USD") return `$${balance.amount}`;
-  return `${balance.amount} ${balance.unit ?? ""}`.trim();
-}
 
-function formatPercent(value: number) {
-  return `${Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1)}%`;
-}
 
-function clamp(value: number) { return Math.max(0, Math.min(100, value)); }
 function title(value: string) { return value.charAt(0).toUpperCase() + value.slice(1); }
 
 export default App;
