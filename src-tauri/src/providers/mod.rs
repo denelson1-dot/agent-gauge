@@ -19,7 +19,10 @@ use crate::{
     settings::{atomic_write_json, SettingsStore},
 };
 
-pub use claude::{capture_status_line_stdin, install_capture, read_capture_status, remove_capture};
+pub use claude::{
+    capture_status_line_stdin, install_capture, migrate_legacy_install, read_capture_status,
+    remove_capture,
+};
 
 const CACHE_FILE: &str = "snapshots.json";
 

@@ -1,4 +1,11 @@
-use std::{fs, io::Read, path::Path};
+use std::{
+    fs,
+    io::{Read, Write},
+    path::Path,
+    process::Stdio,
+    thread,
+    time::{Duration, Instant},
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -9,6 +16,7 @@ use crate::{
         UsageWindow, WindowDisplay, SNAPSHOT_SCHEMA_VERSION,
     },
     paths,
+    platform::{exec, shell},
     settings::atomic_write_json,
 };
 
@@ -17,6 +25,24 @@ use super::{now_unix, ProviderFailure};
 const CAPTURE_FILE: &str = "claude-capture.json";
 const INTEGRATION_FILE: &str = "claude-integration.json";
 const INPUT_CAP: u64 = 256 * 1024;
+
+/// Schema 1 pointed Claude Code at a generated Python script, which shelled out
+/// through `/bin/sh` to chain any status line the user already had. Schema 2
+/// points Claude Code straight at the Agent Gauge executable, which does the
+/// capture and the chaining itself. That removes a Python dependency, a
+/// generated file, and an install path that could half-succeed — and it is the
+/// only version that can work on Windows, where neither `#!` nor `/bin/sh`
+/// exists. See `migrate_legacy_install`.
+const INTEGRATION_SCHEMA_VERSION: u32 = 2;
+
+/// A status line is on the critical path of Claude Code's own rendering, so a
+/// chained command that hangs must not hang Claude. Matches the timeout the
+/// generated Python dispatcher used.
+const CHAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Claude Code renders a single status line; anything beyond this is not
+/// something it would display.
+const CHAIN_OUTPUT_CAP: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct ClaudeCapture {
@@ -117,6 +143,15 @@ fn waiting_snapshot() -> ProviderSnapshot {
     )
 }
 
+/// Entry point for `--capture-claude`.
+///
+/// Claude Code runs this on every status-line update, so it stays headless and
+/// cheap. Two responsibilities: record the usage payload, and honour whatever
+/// status line the user had configured before Agent Gauge took the slot.
+///
+/// Chaining runs even if the capture fails, and its own failures are swallowed.
+/// Agent Gauge borrowed this slot; a bug on our side must not silently delete
+/// the status line the user actually asked for.
 pub fn capture_status_line_stdin() -> Result<(), String> {
     let mut bytes = Vec::new();
     std::io::stdin()
@@ -126,7 +161,22 @@ pub fn capture_status_line_stdin() -> Result<(), String> {
     if bytes.len() as u64 > INPUT_CAP {
         return Err("Claude status input exceeded the safe limit".into());
     }
-    let value: Value = serde_json::from_slice(&bytes)
+
+    let captured = capture_payload(&bytes);
+
+    if let Some(command) = chained_command() {
+        if let Some(output) = run_chained(&command, &bytes) {
+            let mut stdout = std::io::stdout();
+            let _ = stdout.write_all(&output);
+            let _ = stdout.flush();
+        }
+    }
+
+    captured
+}
+
+fn capture_payload(bytes: &[u8]) -> Result<(), String> {
+    let value: Value = serde_json::from_slice(bytes)
         .map_err(|_| "Claude status input was not valid JSON".to_string())?;
     let rate_limits = value.get("rate_limits").unwrap_or(&Value::Null);
     let capture = ClaudeCapture {
@@ -137,6 +187,63 @@ pub fn capture_status_line_stdin() -> Result<(), String> {
         seven_day: parse_window(rate_limits.get("seven_day")),
     };
     atomic_write_json(&paths::cache_dir().join(CAPTURE_FILE), &capture)
+}
+
+/// The status-line command that was configured before Agent Gauge replaced it,
+/// if there was one.
+fn chained_command() -> Option<String> {
+    let metadata = read_metadata().ok()?;
+    metadata.previous.as_ref().and_then(status_line_command)
+}
+
+/// Runs the user's previous status-line command and returns what it printed.
+///
+/// The command is shell source — that is what Claude Code stores and what the
+/// user wrote — so it is handed back to a shell rather than parsed into an argv.
+/// Returns `None` on any failure, including the timeout: a broken chained
+/// command should cost the user their extra status text, nothing more.
+fn run_chained(command: &str, payload: &[u8]) -> Option<Vec<u8>> {
+    let mut child = exec::shell_command(command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    // stdin and stdout are serviced on separate threads. Writing the payload
+    // inline would deadlock as soon as it exceeded the pipe buffer and the
+    // child blocked writing output nobody was reading.
+    let mut stdin = child.stdin.take()?;
+    let owned = payload.to_vec();
+    thread::spawn(move || {
+        let _ = stdin.write_all(&owned);
+        // Dropping the handle closes the pipe, which is what signals EOF.
+    });
+
+    let stdout = child.stdout.take()?;
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.take(CHAIN_OUTPUT_CAP).read_to_end(&mut bytes);
+        bytes
+    });
+
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() < CHAIN_TIMEOUT => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Err(_) => return None,
+        }
+    }
+
+    reader.join().ok()
 }
 
 fn parse_window(value: Option<&Value>) -> Option<CapturedWindow> {
@@ -223,9 +330,6 @@ fn install_capture_inner() -> Result<String, (String, String)> {
         )
     })?;
     let previous = object.get("statusLine").cloned();
-    let dispatcher = paths::claude_dispatcher_path();
-    let executable = std::env::current_exe()
-        .map_err(|error| ("executable_missing".into(), error.to_string()))?;
     let previous_command = previous.as_ref().and_then(status_line_command);
     if previous.is_some() && previous_command.is_none() {
         return Err((
@@ -234,19 +338,11 @@ fn install_capture_inner() -> Result<String, (String, String)> {
                 .into(),
         ));
     }
-    let script = dispatcher_script(&executable, previous_command.as_deref());
-    atomic_write_bytes(&dispatcher, script.as_bytes())
-        .map_err(|message| ("dispatcher_write_failed".into(), message))?;
-    set_executable(&dispatcher).map_err(|message| ("dispatcher_write_failed".into(), message))?;
 
-    let installed = serde_json::json!({
-        "type": "command",
-        "command": dispatcher.display().to_string(),
-        "padding": 0
-    });
+    let installed = installed_status_line()?;
     object.insert("statusLine".into(), installed.clone());
     let metadata = IntegrationMetadata {
-        schema_version: 1,
+        schema_version: INTEGRATION_SCHEMA_VERSION,
         had_previous: previous.is_some(),
         previous,
         installed,
@@ -254,8 +350,10 @@ fn install_capture_inner() -> Result<String, (String, String)> {
     atomic_write_json(&paths::config_dir().join(INTEGRATION_FILE), &metadata)
         .map_err(|message| ("metadata_write_failed".into(), message))?;
     if let Err(message) = atomic_write_json(&settings_path, &settings) {
+        // Claude's settings are the source of truth. If they could not be
+        // updated, our metadata claims an install that does not exist, so drop
+        // it rather than leave the two disagreeing.
         let _ = fs::remove_file(paths::config_dir().join(INTEGRATION_FILE));
-        let _ = fs::remove_file(&dispatcher);
         return Err(("settings_write_failed".into(), message));
     }
     Ok("Claude capture connected; data appears after normal Claude Code activity".into())
@@ -313,26 +411,111 @@ fn remove_capture_inner() -> Result<String, (String, String)> {
     atomic_write_json(&settings_path, &settings)
         .map_err(|message| ("settings_write_failed".into(), message))?;
     let _ = fs::remove_file(metadata_path);
-    let _ = fs::remove_file(paths::claude_dispatcher_path());
+    let _ = fs::remove_file(paths::legacy_claude_dispatcher_path());
     Ok("Claude capture disconnected and the prior status line restored".into())
 }
 
-fn dispatcher_script(executable: &Path, previous: Option<&str>) -> String {
-    let executable = serde_json::to_string(&executable.display().to_string()).unwrap();
-    let previous = serde_json::to_string(&previous).unwrap();
-    format!(
-        r#"#!/usr/bin/env python3
-import subprocess, sys
-payload = sys.stdin.buffer.read(262145)
-if len(payload) > 262144:
-    raise SystemExit(0)
-subprocess.run([{executable}, "--capture-claude"], input=payload, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2, check=False)
-previous = {previous}
-if previous:
-    result = subprocess.run(["/bin/sh", "-c", previous], input=payload, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=2, check=False)
-    sys.stdout.buffer.write(result.stdout[:65536])
-"#
-    )
+/// The `statusLine` value Agent Gauge writes into Claude Code's settings.
+///
+/// Claude Code hands this string to a shell, so it is shell source and must be
+/// quoted for the host's shell — an installation under `C:\Program Files` or a
+/// Linux home directory with a space in it both depend on getting this right.
+fn installed_status_line() -> Result<Value, (String, String)> {
+    let executable = std::env::current_exe()
+        .map_err(|error| ("executable_missing".into(), error.to_string()))?;
+    let command = shell::command_line(&executable, &["--capture-claude"])
+        .map_err(|message| ("executable_unquotable".into(), message))?;
+
+    Ok(serde_json::json!({
+        "type": "command",
+        "command": command,
+        "padding": 0
+    }))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MigrationDecision {
+    /// Already current, or nothing of ours to migrate.
+    NotNeeded,
+    /// Out of date, but the live status line is no longer the one we wrote.
+    /// The user has taken the slot back; leave it exactly as found.
+    Blocked,
+    Proceed,
+}
+
+fn migration_decision(
+    schema_version: u32,
+    live_status_line: Option<&Value>,
+    installed: &Value,
+) -> MigrationDecision {
+    if schema_version >= INTEGRATION_SCHEMA_VERSION {
+        return MigrationDecision::NotNeeded;
+    }
+    if live_status_line != Some(installed) {
+        return MigrationDecision::Blocked;
+    }
+    MigrationDecision::Proceed
+}
+
+fn read_metadata() -> Result<IntegrationMetadata, String> {
+    let path = paths::config_dir().join(INTEGRATION_FILE);
+    let bytes =
+        fs::read(&path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    serde_json::from_slice(&bytes).map_err(|_| "Capture metadata is invalid".to_string())
+}
+
+/// Moves an existing schema-1 installation onto the self-exec status line.
+///
+/// Runs at startup. The generated Python dispatcher still works on Linux, so
+/// this is not urgent for a running install — but leaving two mechanisms alive
+/// means every future change has to be made twice, which is exactly the drift
+/// this port exists to avoid.
+///
+/// Deliberately conservative: if the live status line is not the one we
+/// installed, the user has since changed it themselves and we leave it alone.
+/// `previous` is carried across unchanged, so disconnecting still restores
+/// whatever was there before Agent Gauge.
+pub fn migrate_legacy_install() {
+    let Ok(metadata) = read_metadata() else {
+        return;
+    };
+
+    let settings_path = paths::claude_settings_path();
+    let Ok(mut settings) = read_json(&settings_path) else {
+        return;
+    };
+    let Some(object) = settings.as_object_mut() else {
+        return;
+    };
+
+    if migration_decision(
+        metadata.schema_version,
+        object.get("statusLine"),
+        &metadata.installed,
+    ) != MigrationDecision::Proceed
+    {
+        return;
+    }
+
+    let Ok(installed) = installed_status_line() else {
+        return;
+    };
+    object.insert("statusLine".into(), installed.clone());
+
+    let migrated = IntegrationMetadata {
+        schema_version: INTEGRATION_SCHEMA_VERSION,
+        had_previous: metadata.had_previous,
+        previous: metadata.previous,
+        installed,
+    };
+    if atomic_write_json(&paths::config_dir().join(INTEGRATION_FILE), &migrated).is_err() {
+        return;
+    }
+    if atomic_write_json(&settings_path, &settings).is_err() {
+        return;
+    }
+
+    let _ = fs::remove_file(paths::legacy_claude_dispatcher_path());
 }
 
 fn status_line_command(value: &Value) -> Option<String> {
@@ -347,30 +530,6 @@ fn read_json(path: &Path) -> Result<Value, String> {
         fs::read(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
     serde_json::from_slice(&bytes)
         .map_err(|_| format!("{} does not contain valid JSON", path.display()))
-}
-
-fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    crate::paths::ensure_parent(path)?;
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, bytes)
-        .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
-    fs::rename(&temporary, path)
-        .map_err(|error| format!("could not replace {}: {error}", path.display()))
-}
-
-#[cfg(unix)]
-fn set_executable(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut permissions = fs::metadata(path)
-        .map_err(|error| error.to_string())?
-        .permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(path, permissions).map_err(|error| error.to_string())
-}
-
-#[cfg(not(unix))]
-fn set_executable(_path: &Path) -> Result<(), String> {
-    Ok(())
 }
 
 #[cfg(test)]
@@ -393,5 +552,99 @@ mod tests {
     fn missing_window_is_honestly_absent() {
         assert!(parse_window(None).is_none());
         assert!(parse_window(Some(&serde_json::json!({}))).is_none());
+    }
+
+    fn legacy_installed() -> Value {
+        serde_json::json!({
+            "type": "command",
+            "command": "/home/someone/.config/agent-gauge/claude-status-dispatcher.py",
+            "padding": 0
+        })
+    }
+
+    #[test]
+    fn migration_upgrades_an_installation_we_still_own() {
+        let installed = legacy_installed();
+        assert_eq!(
+            migration_decision(1, Some(&installed), &installed),
+            MigrationDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn migration_leaves_a_status_line_the_user_has_taken_back() {
+        // The single most important case: Claude Code's settings belong to the
+        // user, and a status line we no longer own must survive untouched.
+        let installed = legacy_installed();
+        let theirs = serde_json::json!({ "type": "command", "command": "my-own-script" });
+
+        assert_eq!(
+            migration_decision(1, Some(&theirs), &installed),
+            MigrationDecision::Blocked
+        );
+        assert_eq!(
+            migration_decision(1, None, &installed),
+            MigrationDecision::Blocked
+        );
+    }
+
+    #[test]
+    fn migration_is_a_no_op_once_current() {
+        let installed = legacy_installed();
+        assert_eq!(
+            migration_decision(INTEGRATION_SCHEMA_VERSION, Some(&installed), &installed),
+            MigrationDecision::NotNeeded
+        );
+        // And stays a no-op if a future version writes a newer schema.
+        assert_eq!(
+            migration_decision(INTEGRATION_SCHEMA_VERSION + 1, None, &installed),
+            MigrationDecision::NotNeeded
+        );
+    }
+
+    #[test]
+    fn the_installed_command_reinvokes_this_executable_for_capture() {
+        let installed = installed_status_line().expect("current_exe should be resolvable");
+
+        let command = installed
+            .get("command")
+            .and_then(Value::as_str)
+            .expect("the status line must carry a command string");
+
+        assert!(command.contains("--capture-claude"));
+        assert!(
+            !command.contains("python") && !command.contains("/bin/sh"),
+            "the status line must not depend on an interpreter or a shell being installed"
+        );
+
+        // Quoted for the host shell, since Claude Code hands this to a shell.
+        let quoted = if cfg!(target_os = "windows") {
+            '"'
+        } else {
+            '\''
+        };
+        assert!(
+            command.starts_with(quoted),
+            "the executable path must be quoted: {command}"
+        );
+    }
+
+    #[test]
+    fn a_previous_status_line_is_recovered_from_both_recorded_shapes() {
+        // Claude Code accepts a bare string or an object with `command`;
+        // chaining has to understand whichever the user had.
+        assert_eq!(
+            status_line_command(&serde_json::json!("my-script --flag")).as_deref(),
+            Some("my-script --flag")
+        );
+        assert_eq!(
+            status_line_command(&serde_json::json!({ "type": "command", "command": "my-script" }))
+                .as_deref(),
+            Some("my-script")
+        );
+        assert_eq!(
+            status_line_command(&serde_json::json!({ "type": "other" })),
+            None
+        );
     }
 }
