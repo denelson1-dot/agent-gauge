@@ -9,6 +9,12 @@
     "id": { "type": "string", "pattern": "^[a-z0-9-]{1,64}$" },
     "name": { "type": "string", "minLength": 1, "maxLength": 80 },
     "command": { "type": "string", "minLength": 1 },
+    "interpreter": {
+      "description": "How to launch `command` when the operating system cannot do it alone: the program to run followed by any fixed arguments it needs. The adapter's own path is appended after these, then `args`. Omit it on Linux, where a `#!` line and the execute bit are enough. Windows has neither, so a script there must name what runs it, for example [\"powershell\", \"-NoProfile\", \"-ExecutionPolicy\", \"Bypass\", \"-File\"].",
+      "type": "array",
+      "maxItems": 8,
+      "items": { "type": "string", "minLength": 1, "maxLength": 2048 }
+    },
     "args": { "type": "array", "maxItems": 32, "items": { "type": "string", "maxLength": 2048 } },
     "refresh_interval_seconds": { "type": "integer", "minimum": 60, "maximum": 86400 },
     "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 30 },

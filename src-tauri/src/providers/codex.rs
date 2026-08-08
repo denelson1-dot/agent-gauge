@@ -15,7 +15,9 @@ use super::{now_unix, ProviderFailure};
 const TIMEOUT: Duration = Duration::from_secs(12);
 
 pub fn read() -> Result<ProviderSnapshot, ProviderFailure> {
-    let mut child = Command::new("codex")
+    // Resolved rather than passed as a bare name: the Codex CLI installs as
+    // `codex.cmd` on Windows, and CreateProcess does not consult PATHEXT.
+    let mut child = Command::new(crate::platform::exec::resolve_program("codex"))
         .arg("app-server")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

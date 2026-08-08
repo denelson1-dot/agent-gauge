@@ -32,6 +32,18 @@ struct Manifest {
     id: String,
     name: String,
     command: String,
+    /// How to launch `command`, when the operating system cannot do it alone.
+    ///
+    /// The program to run, followed by any fixed arguments it needs; the
+    /// adapter's own path is appended after them, then `args`. Empty means
+    /// launch `command` directly, which is what a Linux adapter with a `#!`
+    /// line and an execute bit does.
+    ///
+    /// Windows has no shebang and no execute bit, so a script there must say
+    /// what runs it — for example
+    /// `["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]`.
+    #[serde(default)]
+    interpreter: Vec<String>,
     #[serde(default)]
     args: Vec<String>,
     #[serde(default = "default_interval")]
@@ -79,28 +91,70 @@ struct AdapterBalance {
     unit: String,
 }
 
-pub fn ensure_sample() {
-    let directory = paths::adapters_dir().join("sample");
-    let manifest = directory.join("manifest.json");
-    let executable = directory.join("read-usage");
-    if manifest.exists() || executable.exists() {
-        return;
-    }
-    if let Err(error) = fs::create_dir_all(&directory) {
-        eprintln!("Agent Gauge could not create sample adapter: {error}");
-        return;
-    }
-    let manifest_value = serde_json::json!({
-        "schema_version": 1,
-        "id": "sample",
-        "name": "Sample Adapter",
-        "command": "./read-usage",
-        "args": [],
-        "refresh_interval_seconds": 300,
-        "timeout_seconds": 10,
-        "accent": "#8fc98a"
-    });
-    let script = r#"#!/usr/bin/env python3
+/// The scripting language Agent Gauge generates starter adapters in.
+///
+/// Chosen per platform so a generated adapter runs without the user installing
+/// anything: `python3` is present on a normal Linux desktop, PowerShell ships
+/// with Windows. The two templates must emit the same JSON — that contract, not
+/// the language, is what an adapter is.
+struct ScaffoldLanguage {
+    /// File name for the generated script, including its extension.
+    file_name: &'static str,
+    /// The manifest's `interpreter`, launching the script by path.
+    interpreter: &'static [&'static str],
+}
+
+#[cfg(target_os = "windows")]
+const SCAFFOLD: ScaffoldLanguage = ScaffoldLanguage {
+    file_name: "read-usage.ps1",
+    interpreter: &[
+        "powershell",
+        "-NoProfile",
+        // Generated locally, so it carries no mark-of-the-web, but an estate
+        // policy of AllSigned would still refuse it. Scoped to this one child
+        // process; it changes nothing on the machine.
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+    ],
+};
+
+#[cfg(not(target_os = "windows"))]
+const SCAFFOLD: ScaffoldLanguage = ScaffoldLanguage {
+    file_name: "read-usage.py",
+    interpreter: &["python3"],
+};
+
+/// A worked example: reports two windows and a balance so the shape of a real
+/// reading is visible. Shipped disabled.
+// Written with a here-string rather than ConvertTo-Json on purpose.
+// ConvertTo-Json's treatment of single-element arrays has varied between
+// PowerShell versions, and `balances` here is exactly that case — a starter
+// that silently emitted an object where Agent Gauge expects an array would be
+// a miserable first experience. Emitting the JSON literally is version-proof,
+// and it shows the contract an adapter has to meet.
+#[cfg(target_os = "windows")]
+const SAMPLE_SCRIPT: &str = r#"$ErrorActionPreference = "Stop"
+$stamp = "yyyy-MM-ddTHH:mm:ssZ"
+$now = (Get-Date).ToUniversalTime()
+$observed = $now.ToString($stamp)
+$rolling = $now.AddHours(2).ToString($stamp)
+$weekly = $now.AddDays(4).ToString($stamp)
+
+@"
+{"schema_version":1,
+ "observed_at":"$observed",
+ "status":"connected",
+ "windows":[
+   {"id":"rolling","label":"5 hour","used_percent":32.0,"resets_at":"$rolling","window_minutes":300,"display":"ring"},
+   {"id":"weekly","label":"Weekly","used_percent":14.0,"resets_at":"$weekly","window_minutes":10080,"display":"bar"}
+ ],
+ "balances":[{"id":"credits","label":"Credits","amount":"12.50","unit":"USD"}]}
+"@
+"#;
+
+#[cfg(not(target_os = "windows"))]
+const SAMPLE_SCRIPT: &str = r#"#!/usr/bin/env python3
 import datetime, json
 now = datetime.datetime.now(datetime.timezone.utc)
 print(json.dumps({
@@ -114,21 +168,75 @@ print(json.dumps({
   "balances": [{"id":"credits","label":"Credits","amount":"12.50","unit":"USD"}]
 }))
 "#;
-    if crate::settings::atomic_write_json(&manifest, &manifest_value).is_err()
-        || fs::write(&executable, script).is_err()
+
+/// The starting point for a user's own adapter: valid, honest about having no
+/// data yet, and ready to be edited.
+#[cfg(target_os = "windows")]
+const STARTER_SCRIPT: &str = r#"$ErrorActionPreference = "Stop"
+
+# Replace this with a real reading. Agent Gauge only needs valid JSON on
+# stdout; see the adapter schema in the project's schemas directory.
+@"
+{"schema_version":1,
+ "status":"waiting",
+ "windows":[],
+ "balances":[]}
+"@
+"#;
+
+#[cfg(not(target_os = "windows"))]
+const STARTER_SCRIPT: &str = r#"#!/usr/bin/env python3
+import json
+print(json.dumps({
+  "schema_version": 1,
+  "status": "waiting",
+  "windows": [],
+  "balances": []
+}))
+"#;
+
+fn scaffold_manifest(id: &str, name: &str, accent: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "id": id,
+        "name": name,
+        "command": format!("./{}", SCAFFOLD.file_name),
+        "interpreter": SCAFFOLD.interpreter,
+        "args": [],
+        "refresh_interval_seconds": 300,
+        "timeout_seconds": 10,
+        "accent": accent
+    })
+}
+
+pub fn ensure_sample() {
+    let directory = paths::adapters_dir().join("sample");
+    let manifest = directory.join("manifest.json");
+    // Any previously generated script counts, including the extensionless name
+    // earlier versions used, so an existing sample is never overwritten.
+    let existing = ["read-usage", "read-usage.py", "read-usage.ps1"]
+        .iter()
+        .any(|name| directory.join(name).exists());
+    if manifest.exists() || existing {
+        return;
+    }
+    if let Err(error) = fs::create_dir_all(&directory) {
+        eprintln!("Agent Gauge could not create sample adapter: {error}");
+        return;
+    }
+
+    let executable = directory.join(SCAFFOLD.file_name);
+    if crate::settings::atomic_write_json(
+        &manifest,
+        &scaffold_manifest("sample", "Sample Adapter", "#8fc98a"),
+    )
+    .is_err()
+        || fs::write(&executable, SAMPLE_SCRIPT).is_err()
     {
         eprintln!("Agent Gauge could not write the sample adapter");
         return;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = fs::metadata(&executable) {
-            let mut permissions = metadata.permissions();
-            permissions.set_mode(0o700);
-            let _ = fs::set_permissions(&executable, permissions);
-        }
-    }
+    let _ = set_executable(&executable);
 }
 
 pub fn ensure_sample_disabled(app: &AppHandle) {
@@ -197,32 +305,16 @@ pub fn create_scaffold(app: &AppHandle, name: &str) -> ActionResult {
             format!("Could not create tracker folder: {error}"),
         );
     }
-    let manifest = serde_json::json!({
-        "schema_version": 1,
-        "id": id,
-        "name": name,
-        "command": "./read-usage",
-        "args": [],
-        "refresh_interval_seconds": 300,
-        "timeout_seconds": 10,
-        "accent": "#9a8fc9"
-    });
-    let script = r#"#!/usr/bin/env python3
-import json
-print(json.dumps({
-  "schema_version": 1,
-  "status": "waiting",
-  "windows": [],
-  "balances": []
-}))
-"#;
-    if let Err(error) =
-        crate::settings::atomic_write_json(&directory.join("manifest.json"), &manifest)
-            .and_then(|()| {
-                fs::write(directory.join("read-usage"), script)
-                    .map_err(|error| format!("could not write starter executable: {error}"))
-            })
-            .and_then(|()| set_executable(&directory.join("read-usage")))
+    let executable = directory.join(SCAFFOLD.file_name);
+    if let Err(error) = crate::settings::atomic_write_json(
+        &directory.join("manifest.json"),
+        &scaffold_manifest(&id, name, "#9a8fc9"),
+    )
+    .and_then(|()| {
+        fs::write(&executable, STARTER_SCRIPT)
+            .map_err(|error| format!("could not write starter executable: {error}"))
+    })
+    .and_then(|()| set_executable(&executable))
     {
         return action_error("adapter_create_failed", error);
     }
@@ -510,8 +602,27 @@ fn load_adapter(directory: &Path) -> Result<Discovered, String> {
     if manifest.args.len() > 32 || manifest.args.iter().any(|arg| arg.len() > 2048) {
         return Err("adapter arguments exceed the safe limit".into());
     }
+    if manifest.interpreter.len() > 8
+        || manifest
+            .interpreter
+            .iter()
+            .any(|part| part.is_empty() || part.len() > 2048)
+    {
+        return Err("adapter interpreter is invalid".into());
+    }
 
     let executable = resolve_executable(directory, &manifest.command)?;
+
+    // Reported here rather than at spawn time so the settings UI can explain
+    // the problem before the user tries to trust the adapter.
+    if manifest.interpreter.is_empty()
+        && !crate::platform::exec::is_directly_executable(&executable)
+    {
+        return Err(
+            "this system cannot run the adapter command directly; add an \"interpreter\" to the manifest"
+                .into(),
+        );
+    }
     let executable_bytes = fs::read(&executable)
         .map_err(|error| format!("could not read adapter executable: {error}"))?;
     Ok(Discovered {
@@ -547,9 +658,28 @@ fn resolve_executable(directory: &Path, command: &str) -> Result<PathBuf, String
     Ok(canonical)
 }
 
+/// Builds the command that launches an adapter.
+///
+/// Trust is bound to the SHA-256 of the manifest and of the executable, and the
+/// manifest carries the interpreter, so naming an interpreter cannot widen what
+/// runs without invalidating trust first.
+fn spawn_command(adapter: &Discovered) -> Command {
+    let interpreter = &adapter.manifest.interpreter;
+    let Some((program, fixed_args)) = interpreter.split_first() else {
+        let mut command = Command::new(&adapter.executable);
+        command.args(&adapter.manifest.args);
+        return command;
+    };
+
+    let mut command = Command::new(crate::platform::exec::resolve_program(program));
+    command.args(fixed_args);
+    command.arg(&adapter.executable);
+    command.args(&adapter.manifest.args);
+    command
+}
+
 fn run(adapter: &Discovered) -> Result<ProviderSnapshot, ProviderFailure> {
-    let mut child = Command::new(&adapter.executable)
-        .args(&adapter.manifest.args)
+    let mut child = spawn_command(adapter)
         .current_dir(&adapter.directory)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -858,6 +988,127 @@ mod tests {
         assert!(valid_decimal("13.72"));
         assert!(!valid_decimal("NaN"));
         assert!(!valid_decimal("$0"));
+    }
+
+    fn discovered(interpreter: &[&str]) -> Discovered {
+        Discovered {
+            directory: PathBuf::from("/adapters/demo"),
+            manifest: Manifest {
+                schema_version: 1,
+                id: "demo".into(),
+                name: "Demo".into(),
+                command: "./read-usage.py".into(),
+                interpreter: interpreter.iter().map(|part| (*part).to_string()).collect(),
+                args: vec!["--verbose".into()],
+                refresh_interval_seconds: 300,
+                timeout_seconds: 10,
+                accent: None,
+            },
+            executable: PathBuf::from("/adapters/demo/read-usage.py"),
+            manifest_hash: String::new(),
+            executable_hash: String::new(),
+        }
+    }
+
+    #[test]
+    fn an_adapter_without_an_interpreter_is_launched_directly() {
+        let command = spawn_command(&discovered(&[]));
+
+        assert_eq!(command.get_program(), "/adapters/demo/read-usage.py");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, ["--verbose"]);
+    }
+
+    #[test]
+    fn an_interpreter_receives_its_own_arguments_then_the_script() {
+        // The ordering that matters: PowerShell's `-File` has to be followed by
+        // the script path, and the adapter's own arguments come after it.
+        let command = spawn_command(&discovered(&[
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ]));
+
+        assert_eq!(command.get_program(), "powershell");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "/adapters/demo/read-usage.py",
+                "--verbose"
+            ]
+        );
+    }
+
+    /// Runs a generated scaffold exactly as Agent Gauge would and returns what
+    /// it printed.
+    ///
+    /// This is the only check that exercises the real interpreter, so on a
+    /// Windows CI runner it is what proves the PowerShell templates work —
+    /// the platform the templates are for is also the platform that runs them
+    /// here.
+    fn run_scaffold(script: &str, name: &str) -> String {
+        let directory = std::env::temp_dir().join(format!("agent-gauge-scaffold-{name}"));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("should be able to create a temp adapter directory");
+        let path = directory.join(SCAFFOLD.file_name);
+        fs::write(&path, script).expect("should be able to write the scaffold");
+        let _ = set_executable(&path);
+
+        let (program, fixed) = SCAFFOLD
+            .interpreter
+            .split_first()
+            .expect("the scaffold must name an interpreter");
+
+        let output = Command::new(crate::platform::exec::resolve_program(program))
+            .args(fixed)
+            .arg(&path)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("could not run the scaffold interpreter {program}: {error}")
+            });
+
+        let _ = fs::remove_dir_all(&directory);
+        assert!(
+            output.status.success(),
+            "scaffold exited with {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("scaffold output should be UTF-8")
+    }
+
+    #[test]
+    fn the_generated_sample_reports_a_reading_agent_gauge_can_parse() {
+        let stdout = run_scaffold(SAMPLE_SCRIPT, "sample");
+        let snapshot: AdapterSnapshot =
+            serde_json::from_str(&stdout).unwrap_or_else(|error| panic!("{error}: {stdout}"));
+
+        assert_eq!(snapshot.schema_version, 1);
+        assert_eq!(snapshot.status, "connected");
+        assert_eq!(snapshot.windows.len(), 2);
+        // The case that made these templates avoid ConvertTo-Json: a
+        // single-element array must not degrade into an object.
+        assert_eq!(snapshot.balances.len(), 1);
+        assert!(snapshot.observed_at.is_some());
+    }
+
+    #[test]
+    fn the_generated_starter_is_valid_and_honest_about_having_no_data() {
+        let stdout = run_scaffold(STARTER_SCRIPT, "starter");
+        let snapshot: AdapterSnapshot =
+            serde_json::from_str(&stdout).unwrap_or_else(|error| panic!("{error}: {stdout}"));
+
+        assert_eq!(snapshot.schema_version, 1);
+        assert_eq!(snapshot.status, "waiting");
+        assert!(snapshot.windows.is_empty());
+        assert!(snapshot.balances.is_empty());
     }
 
     #[test]
