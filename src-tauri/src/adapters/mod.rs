@@ -1031,7 +1031,19 @@ mod tests {
             "-File",
         ]));
 
-        assert_eq!(command.get_program(), "powershell");
+        // The interpreter goes through resolve_program, so on Windows this is
+        // the full resolved path — `C:\Windows\System32\WindowsPowerShell\
+        // v1.0\powershell.EXE` — rather than the bare name in the manifest.
+        // That resolution is the point; assert the program identity without
+        // pinning a spelling that is correctly different per platform.
+        let program = command.get_program().to_string_lossy().to_ascii_lowercase();
+        assert!(
+            program == "powershell" || program.ends_with("powershell.exe"),
+            "unexpected interpreter program: {program}"
+        );
+
+        // The ordering is what this test is really for, and it is identical
+        // everywhere.
         let args: Vec<_> = command.get_args().collect();
         assert_eq!(
             args,
