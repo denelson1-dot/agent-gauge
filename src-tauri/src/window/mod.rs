@@ -121,15 +121,44 @@ pub fn close_settings(app: &AppHandle) -> Result<(), String> {
 
 pub fn initialize_widget(app: &AppHandle) -> Result<(), String> {
     let window = widget(app)?;
-    restore_geometry(app, &window)?;
-    realize_widget(&window)?;
-    install_map_policy(app, &window)?;
+
+    // Held across the whole sequence so the intermediate positions below are
+    // not mistaken for the user moving the widget and written back to disk.
+    let transition = &app.state::<ManagedWindowState>().geometry_transition_active;
+    transition.store(true, Ordering::Release);
+
+    let result = restore_geometry(app, &window)
+        .and_then(|()| realize_widget(&window))
+        .and_then(|()| install_map_policy(app, &window));
+    if let Err(error) = result {
+        transition.store(false, Ordering::Release);
+        return Err(error);
+    }
 
     let state = app.state::<ManagedWindowState>().snapshot();
     apply_window_policy(&window, &state)?;
     if state.visible {
         show_widget(&window)?;
         enforce_focus_policy(&window, state.locked)?;
+    }
+
+    // Apply the position again now the window is mapped at its real size.
+    //
+    // Before mapping, the window still has the default size from tauri.conf.
+    // X clamps a requested position so the window stays on screen, and it does
+    // that against whatever size the window has *at the time* — the default,
+    // not the restored one. A right-aligned widget therefore lands short by the
+    // difference between the two widths, and because the shortfall is then
+    // captured and saved, it recurs on every start.
+    //
+    // This mirrors what the hide/show path already does, which is why showing
+    // the widget again preserved its position while starting the app did not.
+    match state.geometry.clone() {
+        Some(geometry) if state.visible => {
+            apply_geometry(&window, &geometry, state.mode)?;
+            stabilize_geometry_after_show(app, geometry);
+        }
+        _ => transition.store(false, Ordering::Release),
     }
 
     crate::platform::window::start_layer_watchdog(app);
@@ -152,6 +181,46 @@ pub fn diagnose_layer(app: &AppHandle) -> Result<String, String> {
         state.visible,
         state.geometry,
     ))
+}
+
+/// Reports the monitor layout as Agent Gauge sees it, and where saved geometry
+/// would be restored to.
+///
+/// Geometry problems are almost always a disagreement between what the desktop
+/// reports and what the widget was told, and that disagreement is invisible
+/// from the outside — the window simply appears in the wrong place. This prints
+/// both sides so they can be compared directly.
+pub fn diagnose_geometry(app: &AppHandle) -> Result<String, String> {
+    let window = widget(app)?;
+    let monitors = monitor_bounds(&window)?;
+    let saved = app.state::<ManagedWindowState>().snapshot().geometry;
+
+    let mut report = String::from("monitors as reported to Agent Gauge:\n");
+    for monitor in &monitors {
+        report.push_str(&format!(
+            "  {:?} at ({}, {}) size {}x{} scale {} primary={}\n",
+            monitor.name.as_deref().unwrap_or("<unnamed>"),
+            monitor.x,
+            monitor.y,
+            monitor.width,
+            monitor.height,
+            monitor.scale_factor,
+            monitor.is_primary,
+        ));
+    }
+
+    report.push_str(&format!("saved geometry: {saved:?}\n"));
+    report.push_str(&format!(
+        "would restore to: {:?}\n",
+        recover_geometry(saved.as_ref(), &monitors, MIN_WIDTH, MIN_HEIGHT)
+    ));
+    if let Ok(position) = window.outer_position() {
+        report.push_str(&format!("live outer position: {position:?}\n"));
+    }
+    if let Ok(size) = window.inner_size() {
+        report.push_str(&format!("live inner size: {size:?}"));
+    }
+    Ok(report)
 }
 
 pub fn reassert_current_policy(app: &AppHandle) -> Result<(), String> {

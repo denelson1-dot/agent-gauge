@@ -84,6 +84,10 @@ pub fn run() {
                             Ok(report) => println!("--- agent gauge window layer ---\n{report}"),
                             Err(error) => println!("window layer diagnosis failed: {error}"),
                         }
+                        match window::diagnose_geometry(&for_main) {
+                            Ok(report) => println!("--- agent gauge geometry ---\n{report}"),
+                            Err(error) => println!("geometry diagnosis failed: {error}"),
+                        }
                     });
                 });
             }
