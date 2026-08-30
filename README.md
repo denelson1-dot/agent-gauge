@@ -21,7 +21,7 @@ Both platforms show the same readings, in the same words. Everything the widget 
 
 Open this package with Software Manager and choose **Install**:
 
-`src-tauri/target/release/bundle/deb/Agent Gauge_0.3.0_amd64.deb`
+`src-tauri/target/release/bundle/deb/Agent Gauge_0.3.1_amd64.deb`
 
 That is the complete application package. You do not need Rust, Node.js, a compiler, or any `-dev` packages to use it. Mint's package installer will resolve the normal GTK/WebKit runtime libraries if they are not already present.
 
@@ -79,7 +79,7 @@ A status line belongs to Claude Code's terminal interface. The Claude Code deskt
 
 When a capture is more than two minutes old, Agent Gauge reads the same usage endpoint Claude Code itself polls, authenticating with the sign-in already stored in `~/.claude/.credentials.json`. This is the only request Agent Gauge makes, it goes to Anthropic and nowhere else, and it carries nothing but that token.
 
-That endpoint is asked at most **once every 15 minutes — four requests an hour, and only while no terminal session is running**. Refreshes in between are answered from the last reading, shown with the time it was actually taken. The widget's refresh interval controls how often the display is brought up to date, not how often a request is made, so turning it down to a minute does not turn the request rate up. Reading your usage does not consume it: this is a metering endpoint, not an inference call, and it does not touch the five-hour or weekly windows it reports.
+That endpoint is asked at most **once every 15 minutes — four requests an hour, and only while no terminal session is running**. Refreshes in between are answered from the last reading, shown with the time it was actually taken. The interval is measured from the last attempt rather than the last success, so a rate-limited or rejected request is not retried any faster than a working one; the numbers stay on screen with a note saying why they have stopped moving. The widget's refresh interval controls how often the display is brought up to date, not how often a request is made, so turning it down to a minute does not turn the request rate up. Reading your usage does not consume it: this is a metering endpoint, not an inference call, and it does not touch the five-hour or weekly windows it reports.
 
 Your credentials are read, never written. Refreshing an expired sign-in is Claude Code's job, not Agent Gauge's: attempting it here could invalidate the token Claude Code is holding and sign you out of your own editor. If the sign-in has expired, the gauge says so and opening Claude Code once repairs it.
 

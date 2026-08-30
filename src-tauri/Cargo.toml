@@ -1,6 +1,6 @@
 [package]
 name = "agent-gauge"
-version = "0.3.0"
+version = "0.3.1"
 description = "A local AI subscription usage widget for Linux and Windows"
 authors = ["Dave"]
 edition = "2021"

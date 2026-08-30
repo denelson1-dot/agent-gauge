@@ -103,12 +103,22 @@ pub fn read() -> Result<ProviderSnapshot, ProviderFailure> {
     }
 
     match claude_usage::read(now) {
-        Ok(reading) => Ok(snapshot(
-            reading.five_hour,
-            reading.seven_day,
-            reading.observed_at,
-            FROM_ENDPOINT,
-        )),
+        Ok(reading) => {
+            let mut snapshot = snapshot(
+                reading.five_hour,
+                reading.seven_day,
+                reading.observed_at,
+                FROM_ENDPOINT,
+            );
+            // Numbers we still trust, next to the reason they have stopped
+            // moving. The widget renders this as a warning rather than
+            // replacing the reading with it.
+            if let Some(warning) = reading.warning {
+                snapshot.status_message = warning.message;
+                snapshot.error_code = Some(warning.code);
+            }
+            Ok(snapshot)
+        }
         Err(failure) => match capture {
             Some(capture) if capture.has_usage() => Ok(capture.snapshot(FROM_CAPTURE)),
             // Never captured anything and no sign-in to read: a fresh install,

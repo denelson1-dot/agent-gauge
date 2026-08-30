@@ -58,48 +58,165 @@ pub(super) struct Utilization {
     pub(super) seven_day: Option<CapturedWindow>,
 }
 
-/// A reading and the moment it was taken, which is not necessarily now.
+/// A reading, the moment it was taken — which is not necessarily now — and
+/// anything the caller should warn about while showing it.
+#[derive(Debug)]
 pub(super) struct Reading {
     pub(super) five_hour: Option<CapturedWindow>,
     pub(super) seven_day: Option<CapturedWindow>,
     pub(super) observed_at: i64,
+    /// Set when the last attempt failed but an earlier reading survives. The
+    /// numbers are still worth showing; the reason they have stopped moving is
+    /// worth saying alongside them.
+    pub(super) warning: Option<ProviderFailure>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct CachedUsage {
     schema_version: u32,
-    observed_at: i64,
+    /// When the endpoint was last *asked*, whatever came back.
+    ///
+    /// The floor is measured from here rather than from the last success, so a
+    /// failing endpoint is not asked more often than a working one. Measuring
+    /// from the last success meant a 429 or an expired sign-in fell back to the
+    /// widget's refresh interval and tripled the request rate at exactly the
+    /// moment that was least welcome.
+    attempted_at: i64,
+    observed_at: Option<i64>,
     five_hour: Option<CapturedWindow>,
     seven_day: Option<CapturedWindow>,
+    /// Replayed while the floor holds, so a suppressed retry still explains
+    /// itself instead of going quiet.
+    failure: Option<CachedFailure>,
 }
 
-/// The endpoint's view of usage, polled at most once per [`POLL_INTERVAL`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CachedFailure {
+    code: String,
+    message: String,
+    disconnected: bool,
+}
+
+/// The endpoint's view of usage, asked at most once per [`POLL_INTERVAL`].
 ///
-/// Every refresh in between is answered from the last reading, stamped with
-/// when that reading was actually taken rather than when it was served. The
-/// widget refreshing more often than this costs nothing and asks nothing of
+/// Every refresh in between is answered from what is already on disk, stamped
+/// with when that reading was actually taken rather than when it was served.
+/// The widget refreshing more often than this costs nothing and asks nothing of
 /// Anthropic.
 pub(super) fn read(now: i64) -> Result<Reading, ProviderFailure> {
-    if let Some(cached) = load_cache().filter(|cached| is_current(cached, now)) {
-        return Ok(Reading {
-            five_hour: cached.five_hour,
-            seven_day: cached.seven_day,
-            observed_at: cached.observed_at,
-        });
+    let cached = load_cache().filter(is_usable);
+
+    if let Some(cached) = cached.as_ref().filter(|cached| within_floor(cached, now)) {
+        return replay(cached);
     }
 
-    let utilization = fetch(now)?;
-    let reading = Reading {
-        five_hour: utilization.five_hour,
-        seven_day: utilization.seven_day,
-        observed_at: now,
-    };
-    store(&reading);
-    Ok(reading)
+    match fetch(now) {
+        Ok(utilization) => {
+            let reading = Reading {
+                five_hour: utilization.five_hour,
+                seven_day: utilization.seven_day,
+                observed_at: now,
+                warning: None,
+            };
+            store(&cached_from(&reading, now, None));
+            Ok(reading)
+        }
+        Err(failure) => {
+            let kept = cached.filter(|cached| cached.has_reading());
+            store(&failed_attempt(kept.as_ref(), &failure, now));
+            match kept {
+                Some(cached) => Ok(cached.into_reading(Some(failure))),
+                None => Err(failure),
+            }
+        }
+    }
 }
 
-fn is_current(cached: &CachedUsage, now: i64) -> bool {
-    cached.schema_version == 1 && now.saturating_sub(cached.observed_at) < POLL_INTERVAL
+/// A cache this build knows how to read. An unknown schema is discarded rather
+/// than half-understood, which costs one request and no correctness.
+fn is_usable(cached: &CachedUsage) -> bool {
+    cached.schema_version == 1
+}
+
+fn within_floor(cached: &CachedUsage, now: i64) -> bool {
+    now.saturating_sub(cached.attempted_at) < POLL_INTERVAL
+}
+
+/// What to serve without asking the endpoint again.
+fn replay(cached: &CachedUsage) -> Result<Reading, ProviderFailure> {
+    match (cached.has_reading(), cached.failure.as_ref()) {
+        (true, failure) => Ok(cached.clone().into_reading(failure.map(Into::into))),
+        (false, Some(failure)) => Err(failure.into()),
+        (false, None) => Err(ProviderFailure::disconnected(
+            "usage_unavailable",
+            "Claude reported no rate-limit windows for this account",
+        )),
+    }
+}
+
+impl CachedUsage {
+    fn has_reading(&self) -> bool {
+        self.observed_at.is_some() && (self.five_hour.is_some() || self.seven_day.is_some())
+    }
+
+    fn into_reading(self, warning: Option<ProviderFailure>) -> Reading {
+        Reading {
+            observed_at: self.observed_at.unwrap_or(self.attempted_at),
+            five_hour: self.five_hour,
+            seven_day: self.seven_day,
+            warning,
+        }
+    }
+}
+
+impl From<&CachedFailure> for ProviderFailure {
+    fn from(failure: &CachedFailure) -> Self {
+        Self {
+            code: failure.code.clone(),
+            message: failure.message.clone(),
+            disconnected: failure.disconnected,
+        }
+    }
+}
+
+fn cached_from(
+    reading: &Reading,
+    attempted_at: i64,
+    failure: Option<&ProviderFailure>,
+) -> CachedUsage {
+    CachedUsage {
+        schema_version: 1,
+        attempted_at,
+        observed_at: Some(reading.observed_at),
+        five_hour: reading.five_hour.clone(),
+        seven_day: reading.seven_day.clone(),
+        failure: failure.map(|failure| CachedFailure {
+            code: failure.code.clone(),
+            message: failure.message.clone(),
+            disconnected: failure.disconnected,
+        }),
+    }
+}
+
+/// Records that the endpoint was asked and did not answer, carrying any earlier
+/// reading across so a transient failure does not discard good data.
+fn failed_attempt(
+    kept: Option<&CachedUsage>,
+    failure: &ProviderFailure,
+    attempted_at: i64,
+) -> CachedUsage {
+    CachedUsage {
+        schema_version: 1,
+        attempted_at,
+        observed_at: kept.and_then(|cached| cached.observed_at),
+        five_hour: kept.and_then(|cached| cached.five_hour.clone()),
+        seven_day: kept.and_then(|cached| cached.seven_day.clone()),
+        failure: Some(CachedFailure {
+            code: failure.code.clone(),
+            message: failure.message.clone(),
+            disconnected: failure.disconnected,
+        }),
+    }
 }
 
 fn load_cache() -> Option<CachedUsage> {
@@ -109,14 +226,8 @@ fn load_cache() -> Option<CachedUsage> {
 
 /// Best effort. A cache that cannot be written costs an extra request next
 /// refresh, which is not worth failing a good reading over.
-fn store(reading: &Reading) {
-    let cached = CachedUsage {
-        schema_version: 1,
-        observed_at: reading.observed_at,
-        five_hour: reading.five_hour.clone(),
-        seven_day: reading.seven_day.clone(),
-    };
-    if let Err(error) = atomic_write_json(&paths::cache_dir().join(CACHE_FILE), &cached) {
+fn store(cached: &CachedUsage) {
+    if let Err(error) = atomic_write_json(&paths::cache_dir().join(CACHE_FILE), cached) {
         eprintln!("Agent Gauge could not cache the Claude usage reading: {error}");
     }
 }
@@ -269,28 +380,34 @@ mod tests {
         })
     }
 
-    fn cached(observed_at: i64) -> CachedUsage {
+    fn cached(attempted_at: i64) -> CachedUsage {
         CachedUsage {
             schema_version: 1,
-            observed_at,
+            attempted_at,
+            observed_at: Some(attempted_at),
             five_hour: Some(CapturedWindow {
                 used_percent: 11.0,
                 resets_at: Some(9_000),
             }),
             seven_day: None,
+            failure: None,
         }
+    }
+
+    fn refused() -> ProviderFailure {
+        ProviderFailure::disconnected("oauth_expired", "Claude sign-in has expired")
     }
 
     #[test]
     fn a_reading_inside_the_poll_interval_is_reused_rather_than_refetched() {
         // The widget refreshes every five minutes by default and can be set to
         // every minute. Neither may turn into a request.
-        assert!(is_current(&cached(1_000), 1_000 + POLL_INTERVAL - 1));
+        assert!(within_floor(&cached(1_000), 1_000 + POLL_INTERVAL - 1));
     }
 
     #[test]
     fn the_endpoint_is_asked_again_once_the_interval_has_passed() {
-        assert!(!is_current(&cached(1_000), 1_000 + POLL_INTERVAL));
+        assert!(!within_floor(&cached(1_000), 1_000 + POLL_INTERVAL));
     }
 
     #[test]
@@ -300,11 +417,55 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_attempt_holds_the_floor_just_as_a_successful_one_does() {
+        // The bug this guards: measuring the floor from the last success meant
+        // a 429 or an expired sign-in fell back to the widget's refresh
+        // interval and asked *more* often precisely when it should ask less.
+        let attempt = failed_attempt(None, &refused(), 1_000);
+
+        assert!(within_floor(&attempt, 1_000 + POLL_INTERVAL - 1));
+        assert!(!within_floor(&attempt, 1_000 + POLL_INTERVAL));
+    }
+
+    #[test]
+    fn a_failure_carries_an_earlier_reading_across_rather_than_discarding_it() {
+        let attempt = failed_attempt(Some(&cached(1_000)), &refused(), 2_000);
+
+        assert!(attempt.has_reading());
+        assert_eq!(attempt.observed_at, Some(1_000));
+        assert_eq!(
+            attempt.attempted_at, 2_000,
+            "the floor runs from the attempt, the reading keeps its own age"
+        );
+    }
+
+    #[test]
+    fn a_suppressed_retry_still_shows_the_numbers_and_says_what_is_wrong() {
+        let attempt = failed_attempt(Some(&cached(1_000)), &refused(), 2_000);
+
+        let reading = replay(&attempt).expect("an earlier reading should still be served");
+
+        assert_eq!(reading.observed_at, 1_000);
+        assert_eq!(reading.five_hour.unwrap().used_percent, 11.0);
+        assert_eq!(reading.warning.expect("a warning").code, "oauth_expired");
+    }
+
+    #[test]
+    fn a_suppressed_retry_with_nothing_to_show_reports_the_reason() {
+        let attempt = failed_attempt(None, &refused(), 1_000);
+
+        let failure = replay(&attempt).expect_err("there is nothing to show");
+
+        assert_eq!(failure.code, "oauth_expired");
+    }
+
+    #[test]
     fn a_cache_from_an_unknown_schema_is_refetched_rather_than_trusted() {
         let mut future = cached(1_000);
         future.schema_version = 99;
 
-        assert!(!is_current(&future, 1_000));
+        assert!(!is_usable(&future));
+        assert!(is_usable(&cached(1_000)));
     }
 
     /// Hits the real endpoint with the signed-in user's own token.
