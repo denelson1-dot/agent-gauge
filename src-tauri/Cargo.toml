@@ -1,6 +1,6 @@
 [package]
 name = "agent-gauge"
-version = "0.2.0"
+version = "0.3.0"
 description = "A local AI subscription usage widget for Linux and Windows"
 authors = ["Dave"]
 edition = "2021"
@@ -26,6 +26,7 @@ serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 sha2 = "0.10"
 hex = "0.4"
+ureq = { version = "3.4.0", default-features = false, features = ["rustls", "json"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # The widget surface is drawn directly with GTK/Cairo on Linux; see

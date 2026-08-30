@@ -453,7 +453,7 @@ function SettingsView({
       {!app.settings.onboarding_complete ? (
         <section className="welcome-card">
           <span className="welcome-card__mark">◒</span>
-          <div><h2>Your usage, without the window clutter.</h2><p>Agent Gauge reads signed-in local CLIs and never makes a model call. Claude capture is connected automatically with safe restore support.</p></div>
+          <div><h2>Your usage, without the window clutter.</h2><p>Agent Gauge reads your signed-in CLIs and never makes a model call. Claude capture is connected automatically with safe restore support, and falls back to your Claude account&rsquo;s usage endpoint when no terminal session is running.</p></div>
           <button onClick={() => void update({ onboarding_complete: true })}>Continue</button>
         </section>
       ) : null}

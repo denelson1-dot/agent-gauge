@@ -20,7 +20,7 @@ use crate::{
     settings::atomic_write_json,
 };
 
-use super::{now_unix, ProviderFailure};
+use super::{claude_usage, now_unix, timestamp, ProviderFailure};
 
 const CAPTURE_FILE: &str = "claude-capture.json";
 const INTEGRATION_FILE: &str = "claude-integration.json";
@@ -44,6 +44,19 @@ const CHAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// something it would display.
 const CHAIN_OUTPUT_CAP: u64 = 64 * 1024;
 
+/// How long a status-line capture is treated as current.
+///
+/// The status line repaints throughout an interactive session, so a capture
+/// younger than this means a terminal is actively feeding us and a network
+/// round trip would only confirm what we already know. Older than this and no
+/// terminal is running — the steady state for anyone working in the desktop
+/// app, which draws its interface in Electron and never renders a status line —
+/// so the usage endpoint is asked instead.
+const CAPTURE_TRUSTED_FOR: i64 = 120;
+
+const FROM_CAPTURE: &str = "Captured from Claude Code";
+const FROM_ENDPOINT: &str = "Read from your Claude account";
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct ClaudeCapture {
     schema_version: u32,
@@ -53,10 +66,12 @@ struct ClaudeCapture {
     seven_day: Option<CapturedWindow>,
 }
 
+/// One rate-limit window, from either of the two sources. They report the same
+/// two facts under different names, so they converge here.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-struct CapturedWindow {
-    used_percent: f64,
-    resets_at: Option<i64>,
+pub(super) struct CapturedWindow {
+    pub(super) used_percent: f64,
+    pub(super) resets_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -67,11 +82,121 @@ struct IntegrationMetadata {
     installed: Value,
 }
 
+/// Claude usage, from whichever source can currently answer.
+///
+/// The status-line capture is preferred while it is current: it costs nothing,
+/// needs no credentials and no network, and during an interactive session it is
+/// the freshest thing there is. It is also, on its own, incomplete — it exists
+/// only while a terminal is open, which left desktop-app users with a
+/// permanently empty gauge. `claude_usage` covers that gap.
+///
+/// A capture that has gone stale is still kept as the fallback for an endpoint
+/// that cannot answer. It carries its true age, and `UsageWindow::rolled_over`
+/// drops it outright once its window turns over, so an old reading is shown as
+/// old rather than mistaken for a current one.
 pub fn read() -> Result<ProviderSnapshot, ProviderFailure> {
+    let now = now_unix();
+    let capture = load_capture()?;
+
+    if let Some(capture) = capture.as_ref().filter(|capture| capture.is_current(now)) {
+        return Ok(capture.snapshot(FROM_CAPTURE));
+    }
+
+    match claude_usage::read(now) {
+        Ok(reading) => Ok(snapshot(
+            reading.five_hour,
+            reading.seven_day,
+            reading.observed_at,
+            FROM_ENDPOINT,
+        )),
+        Err(failure) => match capture {
+            Some(capture) if capture.has_usage() => Ok(capture.snapshot(FROM_CAPTURE)),
+            // Never captured anything and no sign-in to read: a fresh install,
+            // not a fault. Keep the onboarding wording rather than reporting an
+            // error against something the user has not set up yet.
+            None if failure.code == "oauth_missing" => Ok(waiting_snapshot()),
+            _ => Err(failure),
+        },
+    }
+}
+
+impl ClaudeCapture {
+    fn has_usage(&self) -> bool {
+        self.five_hour.is_some() || self.seven_day.is_some()
+    }
+
+    fn is_current(&self, now: i64) -> bool {
+        self.has_usage() && now.saturating_sub(self.observed_at) < CAPTURE_TRUSTED_FOR
+    }
+
+    fn snapshot(&self, status_message: &str) -> ProviderSnapshot {
+        snapshot(
+            self.five_hour.clone(),
+            self.seven_day.clone(),
+            self.observed_at,
+            status_message,
+        )
+    }
+}
+
+fn snapshot(
+    five_hour: Option<CapturedWindow>,
+    seven_day: Option<CapturedWindow>,
+    observed_at: i64,
+    status_message: &str,
+) -> ProviderSnapshot {
+    let mut windows = Vec::new();
+    if let Some(window) = five_hour {
+        windows.push(UsageWindow {
+            id: "five-hour".into(),
+            label: "5 hour".into(),
+            used_percent: window.used_percent,
+            resets_at: window.resets_at,
+            window_minutes: Some(300),
+            display: WindowDisplay::Ring,
+        });
+    }
+    if let Some(window) = seven_day {
+        windows.push(UsageWindow {
+            id: "seven-day".into(),
+            label: "Weekly".into(),
+            used_percent: window.used_percent,
+            resets_at: window.resets_at,
+            window_minutes: Some(10_080),
+            display: WindowDisplay::Bar,
+        });
+    }
+
+    ProviderSnapshot {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        id: "claude".into(),
+        name: "Claude".into(),
+        accent: Some("#d9986a".into()),
+        state: if windows.is_empty() {
+            ConnectionState::Waiting
+        } else {
+            ConnectionState::Connected
+        },
+        status_message: if windows.is_empty() {
+            "Waiting for Claude Code rate-limit data".into()
+        } else {
+            status_message.into()
+        },
+        observed_at: Some(observed_at),
+        last_attempt_at: None,
+        error_code: None,
+        windows,
+        balances: Vec::new(),
+        refreshing: false,
+    }
+}
+
+/// The capture file, or `None` when no status line has ever reported in.
+fn load_capture() -> Result<Option<ClaudeCapture>, ProviderFailure> {
     let path = paths::cache_dir().join(CAPTURE_FILE);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(waiting_snapshot()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(ProviderFailure::new(
                 "capture_unreadable",
@@ -87,51 +212,7 @@ pub fn read() -> Result<ProviderSnapshot, ProviderFailure> {
             "Claude capture format is unsupported",
         ));
     }
-
-    let mut windows = Vec::new();
-    if let Some(window) = capture.five_hour {
-        windows.push(UsageWindow {
-            id: "five-hour".into(),
-            label: "5 hour".into(),
-            used_percent: window.used_percent,
-            resets_at: window.resets_at,
-            window_minutes: Some(300),
-            display: WindowDisplay::Ring,
-        });
-    }
-    if let Some(window) = capture.seven_day {
-        windows.push(UsageWindow {
-            id: "seven-day".into(),
-            label: "Weekly".into(),
-            used_percent: window.used_percent,
-            resets_at: window.resets_at,
-            window_minutes: Some(10_080),
-            display: WindowDisplay::Bar,
-        });
-    }
-
-    Ok(ProviderSnapshot {
-        schema_version: SNAPSHOT_SCHEMA_VERSION,
-        id: "claude".into(),
-        name: "Claude".into(),
-        accent: Some("#d9986a".into()),
-        state: if windows.is_empty() {
-            ConnectionState::Waiting
-        } else {
-            ConnectionState::Connected
-        },
-        status_message: if windows.is_empty() {
-            "Waiting for Claude Code rate-limit data".into()
-        } else {
-            "Captured from Claude Code".into()
-        },
-        observed_at: Some(capture.observed_at),
-        last_attempt_at: None,
-        error_code: None,
-        windows,
-        balances: Vec::new(),
-        refreshing: false,
-    })
+    Ok(Some(capture))
 }
 
 fn waiting_snapshot() -> ProviderSnapshot {
@@ -179,14 +260,50 @@ fn capture_payload(bytes: &[u8]) -> Result<(), String> {
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|_| "Claude status input was not valid JSON".to_string())?;
     let rate_limits = value.get("rate_limits").unwrap_or(&Value::Null);
-    let capture = ClaudeCapture {
-        schema_version: 1,
-        observed_at: now_unix(),
-        claude_version: value.get("version").and_then(Value::as_str).map(Into::into),
-        five_hour: parse_window(rate_limits.get("five_hour")),
-        seven_day: parse_window(rate_limits.get("seven_day")),
-    };
+    let capture = merge_capture(
+        load_capture().ok().flatten(),
+        value.get("version").and_then(Value::as_str).map(Into::into),
+        parse_window(rate_limits.get("five_hour")),
+        parse_window(rate_limits.get("seven_day")),
+        now_unix(),
+    );
     atomic_write_json(&paths::cache_dir().join(CAPTURE_FILE), &capture)
+}
+
+/// Folds a status-line payload into what was already captured.
+///
+/// Claude Code does not put `rate_limits` in every status-line payload: it
+/// documents the field as absent whenever plan limits do not apply (API key,
+/// Bedrock, Vertex), and it is simply not there yet on the repaints that happen
+/// before a session's first API response. Taking each payload as the whole
+/// truth meant one such repaint blanked a perfectly good reading — so the
+/// widget went back to "waiting" at the start of every session, which is the
+/// moment a usage gauge is most worth looking at.
+///
+/// `observed_at` therefore tracks the last payload that actually carried usage,
+/// not the last repaint. A retained figure is presented as being as old as it
+/// really is, and `UsageWindow::rolled_over` still discards it outright once
+/// its own reset time passes.
+fn merge_capture(
+    previous: Option<ClaudeCapture>,
+    claude_version: Option<String>,
+    five_hour: Option<CapturedWindow>,
+    seven_day: Option<CapturedWindow>,
+    now: i64,
+) -> ClaudeCapture {
+    let carried_usage = five_hour.is_some() || seven_day.is_some();
+    let previous = previous.filter(|capture| capture.schema_version == 1);
+
+    ClaudeCapture {
+        schema_version: 1,
+        observed_at: match previous.as_ref() {
+            Some(capture) if !carried_usage => capture.observed_at,
+            _ => now,
+        },
+        claude_version,
+        five_hour: five_hour.or_else(|| previous.as_ref().and_then(|c| c.five_hour.clone())),
+        seven_day: seven_day.or_else(|| previous.as_ref().and_then(|c| c.seven_day.clone())),
+    }
 }
 
 /// The status-line command that was configured before Agent Gauge replaced it,
@@ -256,18 +373,6 @@ fn parse_window(value: Option<&Value>) -> Option<CapturedWindow> {
         used_percent,
         resets_at: value.get("resets_at").and_then(timestamp),
     })
-}
-
-fn timestamp(value: &Value) -> Option<i64> {
-    value
-        .as_i64()
-        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
-        .or_else(|| {
-            value
-                .as_str()
-                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
-                .map(|time| time.timestamp())
-        })
 }
 
 pub fn read_capture_status() -> ClaudeCaptureStatus {
@@ -546,6 +651,108 @@ mod tests {
         let parsed = parse_window(Some(&value)).unwrap();
         assert_eq!(parsed.used_percent, 12.5);
         assert!(parsed.resets_at.is_some());
+    }
+
+    fn captured(used_percent: f64, resets_at: i64) -> CapturedWindow {
+        CapturedWindow {
+            used_percent,
+            resets_at: Some(resets_at),
+        }
+    }
+
+    #[test]
+    fn a_payload_without_rate_limits_does_not_blank_the_last_reading() {
+        // The regression this guards: Claude Code repaints its status line
+        // before the session's first API response, and that payload has no
+        // `rate_limits`. Treating it as "usage is now unknown" wiped the file.
+        let previous = merge_capture(None, None, Some(captured(42.0, 9_000)), None, 1_000);
+
+        let merged = merge_capture(previous.clone().into(), None, None, None, 5_000);
+
+        assert_eq!(merged.five_hour.unwrap().used_percent, 42.0);
+        assert_eq!(
+            merged.observed_at, 1_000,
+            "a repaint that carried no usage must not restamp the reading as fresh"
+        );
+    }
+
+    #[test]
+    fn fresh_usage_replaces_the_retained_figure_and_restamps_it() {
+        let previous = merge_capture(None, None, Some(captured(42.0, 9_000)), None, 1_000);
+
+        let merged = merge_capture(
+            previous.into(),
+            None,
+            Some(captured(55.0, 9_000)),
+            None,
+            5_000,
+        );
+
+        assert_eq!(merged.five_hour.unwrap().used_percent, 55.0);
+        assert_eq!(merged.observed_at, 5_000);
+    }
+
+    #[test]
+    fn retention_never_invents_a_reading_that_was_never_taken() {
+        let merged = merge_capture(None, None, None, None, 5_000);
+
+        assert!(merged.five_hour.is_none());
+        assert!(merged.seven_day.is_none());
+        assert_eq!(merged.observed_at, 5_000);
+    }
+
+    #[test]
+    fn a_capture_written_by_an_unknown_schema_is_not_carried_forward() {
+        // `read` refuses such a file, so retention must refuse it too rather
+        // than mixing fields it cannot vouch for into a schema-1 capture.
+        let mut future = merge_capture(None, None, Some(captured(42.0, 9_000)), None, 1_000);
+        future.schema_version = 99;
+
+        let merged = merge_capture(future.into(), None, None, None, 5_000);
+
+        assert!(merged.five_hour.is_none());
+        assert_eq!(merged.observed_at, 5_000);
+    }
+
+    #[test]
+    fn a_live_terminal_session_is_answered_from_the_capture_alone() {
+        // The status line repaints constantly while a session is open, so a
+        // young capture must not trigger a network round trip.
+        let capture = merge_capture(None, None, Some(captured(42.0, 9_000)), None, 1_000);
+
+        assert!(capture.is_current(1_000 + CAPTURE_TRUSTED_FOR - 1));
+    }
+
+    #[test]
+    fn a_capture_no_terminal_is_feeding_stops_being_current() {
+        // The desktop app renders its UI in Electron and never runs a status
+        // line, so its sessions leave the capture frozen. Past this point the
+        // usage endpoint has to be asked or the gauge simply stops moving.
+        let capture = merge_capture(None, None, Some(captured(42.0, 9_000)), None, 1_000);
+
+        assert!(!capture.is_current(1_000 + CAPTURE_TRUSTED_FOR));
+    }
+
+    #[test]
+    fn a_capture_holding_no_usage_is_never_treated_as_current() {
+        // Freshly written by a repaint that carried no rate limits: recent, but
+        // with nothing in it to show.
+        let capture = merge_capture(None, None, None, None, 1_000);
+
+        assert!(!capture.is_current(1_000));
+        assert!(!capture.has_usage());
+    }
+
+    #[test]
+    fn a_snapshot_reports_when_its_numbers_were_taken_not_when_it_was_built() {
+        let capture = merge_capture(None, None, Some(captured(42.0, 9_000)), None, 1_000);
+
+        let snapshot = capture.snapshot(FROM_CAPTURE);
+
+        assert_eq!(snapshot.observed_at, Some(1_000));
+        assert_eq!(snapshot.state, ConnectionState::Connected);
+        assert_eq!(snapshot.windows.len(), 1);
+        assert_eq!(snapshot.status_message, FROM_CAPTURE);
     }
 
     #[test]

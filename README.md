@@ -2,7 +2,7 @@
 
 Agent Gauge is a small, local desktop widget for seeing AI-agent subscription usage at a glance. It runs on Linux and Windows.
 
-It reads the local Codex CLI and a reversible Claude Code status-line feed. It does not scrape provider websites, make model calls, copy provider credentials, send telemetry, or run a hosted service.
+It reads the local Codex CLI, a reversible Claude Code status-line feed, and — when no terminal session is feeding that feed — Claude's own usage endpoint, using the sign-in Claude Code already holds. It does not scrape provider websites, make model calls, store or transmit your credentials anywhere but back to the provider that issued them, send telemetry, or run a hosted service.
 
 ## Supported platforms
 
@@ -21,7 +21,7 @@ Both platforms show the same readings, in the same words. Everything the widget 
 
 Open this package with Software Manager and choose **Install**:
 
-`src-tauri/target/release/bundle/deb/Agent Gauge_0.2.0_amd64.deb`
+`src-tauri/target/release/bundle/deb/Agent Gauge_0.3.0_amd64.deb`
 
 That is the complete application package. You do not need Rust, Node.js, a compiler, or any `-dev` packages to use it. Mint's package installer will resolve the normal GTK/WebKit runtime libraries if they are not already present.
 
@@ -72,6 +72,18 @@ The end-user test pass is in [docs/qa.md](docs/qa.md). It only assumes the appli
 On first launch, Agent Gauge points Claude Code's status-line command at itself. If another command is already configured, Agent Gauge preserves it and runs it afterwards, forwarding its output, when its shape is safe to do so. **Disconnect** restores the prior value and prevents automatic reconnection; **Connect Claude** can enable it again. If that setting changes after connection, Agent Gauge reports a conflict and leaves the live setting untouched.
 
 There is no interpreter to install. Earlier versions generated a Python dispatcher script; an existing installation is migrated to the current mechanism automatically on first launch, and the old script is removed. A status line you have since changed yourself is never touched.
+
+### When the status line cannot report
+
+A status line belongs to Claude Code's terminal interface. The Claude Code desktop app draws its own interface and never renders one, so it never runs the capture command — working there used to leave the Claude gauge empty with nothing in your setup to correct.
+
+When a capture is more than two minutes old, Agent Gauge reads the same usage endpoint Claude Code itself polls, authenticating with the sign-in already stored in `~/.claude/.credentials.json`. This is the only request Agent Gauge makes, it goes to Anthropic and nowhere else, and it carries nothing but that token.
+
+That endpoint is asked at most **once every 15 minutes — four requests an hour, and only while no terminal session is running**. Refreshes in between are answered from the last reading, shown with the time it was actually taken. The widget's refresh interval controls how often the display is brought up to date, not how often a request is made, so turning it down to a minute does not turn the request rate up. Reading your usage does not consume it: this is a metering endpoint, not an inference call, and it does not touch the five-hour or weekly windows it reports.
+
+Your credentials are read, never written. Refreshing an expired sign-in is Claude Code's job, not Agent Gauge's: attempting it here could invalidate the token Claude Code is holding and sign you out of your own editor. If the sign-in has expired, the gauge says so and opening Claude Code once repairs it.
+
+While you are working in a terminal, the status-line capture answers on its own and no request is made.
 
 Disconnect Claude before uninstalling if capture is enabled. Then remove Agent Gauge normally — through Software Manager on Linux, or Installed apps on Windows. The directories in the table above can be deleted afterwards if you also want to reset all preferences and cached readings.
 

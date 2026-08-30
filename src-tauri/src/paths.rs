@@ -23,6 +23,15 @@ pub fn claude_settings_path() -> PathBuf {
     home_dir().join(".claude").join("settings.json")
 }
 
+/// Claude Code's OAuth credentials.
+///
+/// Read for one thing only: the access token used to query the usage endpoint
+/// when no terminal session is feeding the status-line capture. Agent Gauge
+/// never writes this file. See `providers::claude_usage`.
+pub fn claude_credentials_path() -> PathBuf {
+    home_dir().join(".claude").join(".credentials.json")
+}
+
 /// The generated Python status-line dispatcher.
 ///
 /// Retained only so existing installations can be migrated off it; nothing

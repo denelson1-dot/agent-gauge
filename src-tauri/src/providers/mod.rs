@@ -1,4 +1,5 @@
 mod claude;
+mod claude_usage;
 mod codex;
 
 use std::{
@@ -268,4 +269,21 @@ pub(crate) fn emit(app: &AppHandle) {
 
 pub(crate) fn now_unix() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+/// A moment as any of the shapes a provider might report it in.
+///
+/// Shared because the two Claude sources disagree: the status line reports a
+/// Unix integer and the usage endpoint an RFC 3339 string, for the same field
+/// under the same name.
+pub(crate) fn timestamp(value: &serde_json::Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+        .or_else(|| {
+            value
+                .as_str()
+                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+                .map(|time| time.timestamp())
+        })
 }
