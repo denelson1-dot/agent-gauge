@@ -1,8 +1,37 @@
 # Agent Gauge
 
-Agent Gauge is a small, local desktop widget for seeing AI-agent subscription usage at a glance. It runs on Linux and Windows.
+**A small, local desktop widget for seeing your AI-agent subscription usage at a glance.**
 
-It reads the local Codex CLI, a reversible Claude Code status-line feed, and — when no terminal session is feeding that feed — Claude's own usage endpoint, using the sign-in Claude Code already holds. It does not scrape provider websites, make model calls, store or transmit your credentials anywhere but back to the provider that issued them, send telemetry, or run a hosted service.
+[![CI](https://github.com/denelson1-dot/agent-gauge/actions/workflows/ci.yml/badge.svg)](https://github.com/denelson1-dot/agent-gauge/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/denelson1-dot/agent-gauge?display_name=tag&sort=semver)](https://github.com/denelson1-dot/agent-gauge/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/denelson1-dot/agent-gauge/total)](https://github.com/denelson1-dot/agent-gauge/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows-informational)](#supported-platforms)
+
+<p align="center">
+  <img src="docs/images/hero.png" alt="Agent Gauge sitting on the desktop, showing Codex and Claude usage" width="440">
+</p>
+
+Agent Gauge runs on Linux and Windows. It reads the local Codex CLI, a reversible Claude Code status-line feed, and — when no terminal session is feeding that feed — Claude's own usage endpoint, using the sign-in Claude Code already holds.
+
+It does **not** scrape provider websites, make model calls, store or transmit your credentials anywhere but back to the provider that issued them, send telemetry, or run a hosted service. Reading your usage does not consume it.
+
+## Screenshots
+
+<p align="center">
+  <img src="docs/images/themes.png" alt="The Glass, Cutout and Signal themes side by side" width="820">
+</p>
+
+Three themes, chosen to suit the wallpaper underneath: **Glass** is translucent, **Cutout** lets the wallpaper dominate, and **Signal** stays opaque and readable over anything.
+
+<p align="center">
+  <img src="docs/images/settings.png" alt="Agent Gauge settings: appearance and widget layering" width="620">
+</p>
+<p align="center">
+  <img src="docs/images/settings-trackers.png" alt="Agent Gauge settings: read-only tracker connections and Claude Code capture" width="620">
+</p>
+
+Everything is controlled from one settings window: theme, whether the widget sits on the desktop layer or above your apps, which trackers are shown and in what order, the Claude Code capture connection, and refresh behaviour.
 
 ## Supported platforms
 
@@ -17,15 +46,35 @@ Both platforms show the same readings, in the same words. Everything the widget 
 
 ## Install
 
+Download the installer for your platform from the [**latest release**](https://github.com/denelson1-dot/agent-gauge/releases/latest).
+
+| Platform | Download | Notes |
+|---|---|---|
+| Linux (Debian/Ubuntu/Mint) | `Agent.Gauge_<version>_amd64.deb` | Recommended |
+| Linux (any distribution) | `Agent.Gauge_<version>_amd64.AppImage` | No installation; `chmod +x` and run |
+| Windows | `Agent.Gauge_<version>_x64_en-US.msi` | Recommended |
+| Windows | `Agent.Gauge_<version>_x64-setup.exe` | NSIS installer |
+
+You do not need Rust, Node.js, a compiler, or any `-dev` packages to *use* Agent Gauge. Those are only for building from source.
+
 ### Linux
 
-Open this package with Software Manager and choose **Install**:
+Open the downloaded `.deb` with Software Manager and choose **Install** — or from a terminal:
 
-`src-tauri/target/release/bundle/deb/Agent Gauge_0.3.1_amd64.deb`
+```bash
+sudo apt install ./Agent.Gauge_0.3.1_amd64.deb
+```
 
-That is the complete application package. You do not need Rust, Node.js, a compiler, or any `-dev` packages to use it. Mint's package installer will resolve the normal GTK/WebKit runtime libraries if they are not already present.
+That is the complete application package. Your package installer will resolve the normal GTK/WebKit runtime libraries if they are not already present.
 
-After installation, launch **Agent Gauge** from the Cinnamon application menu.
+After installation, launch **Agent Gauge** from your application menu.
+
+To run the AppImage instead:
+
+```bash
+chmod +x Agent.Gauge_0.3.1_amd64.AppImage
+./Agent.Gauge_0.3.1_amd64.AppImage
+```
 
 ### Windows
 

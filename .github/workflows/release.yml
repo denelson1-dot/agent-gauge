@@ -58,3 +58,30 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+  # The bundles are built on two different runners, so nothing has seen all four
+  # files at once until now. Hashing them here — after both legs have uploaded,
+  # and from the release itself rather than from a local build — means the
+  # published checksums describe exactly the bytes a downloader receives.
+  checksums:
+    name: checksums
+    needs: bundle
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download the release assets
+        run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets --pattern 'Agent.Gauge_*'
+
+      - name: Hash them
+        run: |
+          cd assets
+          sha256sum Agent.Gauge_* > ../SHA256SUMS.txt
+          cat ../SHA256SUMS.txt
+
+      - name: Attach the checksums to the release
+        run: gh release upload "$TAG" SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber

@@ -1,0 +1,74 @@
+name: Bug report
+description: Something in Agent Gauge behaves incorrectly
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please include enough detail to reproduce the problem.
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux
+        - Windows
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and desktop
+      description: e.g. "Linux Mint 22.3, Cinnamon, X11" or "Windows 11 23H2"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Agent Gauge version
+      description: From Settings → Diagnostics.
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Which reading is affected
+      options:
+        - Codex
+        - Claude
+        - A custom adapter
+        - Not about a specific reading
+    validations:
+      required: true
+
+  - type: textarea
+    id: layer
+    attributes:
+      label: Window layer diagnosis
+      description: |
+        Only if the problem is about where the widget sits or how it is layered.
+        Run `agent-gauge --diagnose-window-layer` and paste the output.
+      render: text
