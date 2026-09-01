@@ -1,0 +1,32 @@
+name: Feature request
+description: Suggest something Agent Gauge should do
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Agent Gauge is deliberately narrow: it reads usage that providers already
+        expose to software you have signed into locally. It does not scrape
+        provider websites, make model calls, or run a hosted service.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve
+      description: Describe the situation, not the implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: This can be done by reading something already available locally, without scraping a provider website or making a model call.
