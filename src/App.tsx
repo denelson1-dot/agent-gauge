@@ -28,6 +28,7 @@ type Settings = {
   schema_version: number;
   theme: Theme;
   refresh_interval_seconds: number;
+  claude_usage_poll_seconds: number;
   provider_order: string[];
   disabled_providers: string[];
   onboarding_complete: boolean;
@@ -520,6 +521,12 @@ function SettingsView({
             ) : (
               <button onClick={() => void run("install_claude_capture")}>Connect Claude</button>
             )}
+          </div>
+          <div className="setting-row">
+            <div><strong>Backup usage check</strong><small>When no terminal session is feeding the capture, Claude’s usage endpoint is asked at most this often. Reading usage does not consume it.</small></div>
+            <select value={app.settings.claude_usage_poll_seconds} onChange={(event) => void update({ claude_usage_poll_seconds: Number(event.target.value) })}>
+              <option value={60}>1 minute</option><option value={120}>2 minutes</option><option value={300}>5 minutes</option><option value={600}>10 minutes</option><option value={900}>15 minutes</option><option value={1200}>20 minutes</option>
+            </select>
           </div>
 
           <div className="additional-heading">

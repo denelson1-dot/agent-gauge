@@ -7,6 +7,12 @@ use crate::window::WidgetState;
 pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
 pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 
+/// Ten minutes: six requests an hour at most, and only while no terminal
+/// session is running. A five-hour window moves about a third of a percent
+/// per minute at a sustained pace, so a reading this old is still the right
+/// number to make a decision on.
+pub const DEFAULT_CLAUDE_USAGE_POLL_SECONDS: u64 = 600;
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Theme {
@@ -27,6 +33,9 @@ pub struct AppSettings {
     pub schema_version: u32,
     pub theme: Theme,
     pub refresh_interval_seconds: u64,
+    /// The shortest gap between two reads of Claude's usage endpoint, used
+    /// only while no terminal session is feeding the status-line capture.
+    pub claude_usage_poll_seconds: u64,
     pub provider_order: Vec<String>,
     pub disabled_providers: Vec<String>,
     pub adapter_trust: BTreeMap<String, AdapterTrust>,
@@ -40,6 +49,7 @@ impl Default for AppSettings {
             schema_version: SETTINGS_SCHEMA_VERSION,
             theme: Theme::Signal,
             refresh_interval_seconds: 300,
+            claude_usage_poll_seconds: DEFAULT_CLAUDE_USAGE_POLL_SECONDS,
             provider_order: vec!["codex".into(), "claude".into()],
             disabled_providers: Vec::new(),
             adapter_trust: BTreeMap::new(),

@@ -150,18 +150,26 @@ pub fn start(app: &AppHandle) {
     let app = app.clone();
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(30));
-        let interval = app
-            .state::<SettingsStore>()
-            .snapshot()
-            .refresh_interval_seconds;
+        let settings = app.state::<SettingsStore>().snapshot();
+        let interval = settings.refresh_interval_seconds as i64;
+        // The usage endpoint is only consulted on a Claude refresh, so a poll
+        // floor shorter than the widget's refresh interval would never be
+        // reached. Claude is therefore due on the shorter of the two; the
+        // floor inside `claude_usage` still keeps the request rate honest.
+        let claude_interval = interval.min(settings.claude_usage_poll_seconds as i64);
         let now = now_unix();
-        let due = app
-            .state::<ProviderStore>()
-            .snapshots()
+        let snapshots = app.state::<ProviderStore>().snapshots();
+        let elapsed = |provider: &ProviderSnapshot| now - provider.last_attempt_at.unwrap_or(0);
+        let all_due = snapshots
             .iter()
-            .any(|provider| now - provider.last_attempt_at.unwrap_or(0) >= interval as i64);
-        if due {
+            .any(|provider| elapsed(provider) >= interval);
+        let claude_due = snapshots
+            .iter()
+            .any(|provider| provider.id == "claude" && elapsed(provider) >= claude_interval);
+        if all_due {
             refresh_all(&app);
+        } else if claude_due {
+            refresh_provider(&app, "claude");
         }
     });
 }
@@ -178,9 +186,8 @@ pub fn refresh_provider(app: &AppHandle, id: &str) {
         return;
     }
 
-    let disabled = app
-        .state::<SettingsStore>()
-        .snapshot()
+    let settings = app.state::<SettingsStore>().snapshot();
+    let disabled = settings
         .disabled_providers
         .iter()
         .any(|disabled| disabled == id);
@@ -214,10 +221,11 @@ pub fn refresh_provider(app: &AppHandle, id: &str) {
 
     let app = app.clone();
     let id = id.to_string();
+    let poll_interval = settings.claude_usage_poll_seconds as i64;
     thread::spawn(move || {
         let result = match id.as_str() {
             "codex" => codex::read(),
-            "claude" => claude::read(),
+            "claude" => claude::read(poll_interval),
             _ => unreachable!(),
         };
         finish(&app, &id, result);

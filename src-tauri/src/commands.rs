@@ -17,6 +17,7 @@ use crate::{
 pub struct SettingsPatch {
     theme: Option<Theme>,
     refresh_interval_seconds: Option<u64>,
+    claude_usage_poll_seconds: Option<u64>,
     provider_order: Option<Vec<String>>,
     disabled_providers: Option<Vec<String>>,
     onboarding_complete: Option<bool>,
@@ -54,6 +55,9 @@ pub fn apply_settings(app: AppHandle, patch: SettingsPatch) -> Result<ActionResu
         }
         if let Some(interval) = patch.refresh_interval_seconds {
             settings.refresh_interval_seconds = interval;
+        }
+        if let Some(interval) = patch.claude_usage_poll_seconds {
+            settings.claude_usage_poll_seconds = interval;
         }
         if let Some(order) = patch.provider_order {
             settings.provider_order = order;

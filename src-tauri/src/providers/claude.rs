@@ -94,7 +94,9 @@ struct IntegrationMetadata {
 /// that cannot answer. It carries its true age, and `UsageWindow::rolled_over`
 /// drops it outright once its window turns over, so an old reading is shown as
 /// old rather than mistaken for a current one.
-pub fn read() -> Result<ProviderSnapshot, ProviderFailure> {
+/// `poll_interval` is the user's floor on how often the usage endpoint may be
+/// asked; it has no bearing on the capture path.
+pub fn read(poll_interval: i64) -> Result<ProviderSnapshot, ProviderFailure> {
     let now = now_unix();
     let capture = load_capture()?;
 
@@ -102,7 +104,7 @@ pub fn read() -> Result<ProviderSnapshot, ProviderFailure> {
         return Ok(capture.snapshot(FROM_CAPTURE));
     }
 
-    match claude_usage::read(now) {
+    match claude_usage::read(now, poll_interval) {
         Ok(reading) => {
             let mut snapshot = snapshot(
                 reading.five_hour,

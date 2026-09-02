@@ -33,21 +33,6 @@ use super::{claude::CapturedWindow, timestamp, ProviderFailure};
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CACHE_FILE: &str = "claude-usage.json";
 
-/// The shortest gap between two calls to the endpoint.
-///
-/// Deliberately decoupled from the widget's refresh interval, which the user
-/// can set as low as a minute and which governs how often the *display* is
-/// brought up to date — not how often a provider is allowed to make a network
-/// request. Without this floor, turning the refresh rate up would silently turn
-/// the request rate up with it.
-///
-/// Fifteen minutes is chosen against what the reading is for: a five-hour
-/// window moves about a third of a percent per minute at a sustained pace, so a
-/// quarter-hour-old figure is still the right number to make a decision on. The
-/// cost of the floor is bounded staleness; the benefit is a hard ceiling of
-/// four requests an hour no matter how the widget is configured.
-const POLL_INTERVAL: i64 = 900;
-
 /// Matches the timeout Claude Code uses for the same request, doubled for the
 /// slower networks a desktop widget will sit on. This runs on the provider's
 /// own thread, so it delays one refresh and nothing else.
@@ -97,16 +82,27 @@ struct CachedFailure {
     disconnected: bool,
 }
 
-/// The endpoint's view of usage, asked at most once per [`POLL_INTERVAL`].
+/// The endpoint's view of usage, asked at most once per `poll_interval`
+/// seconds — the user's *Backup usage check* setting.
+///
+/// The floor is deliberately decoupled from the widget's refresh interval,
+/// which governs how often the *display* is brought up to date, not how often
+/// a provider is allowed to make a network request. Without it, turning the
+/// refresh rate up would silently turn the request rate up with it. The cost
+/// of a longer floor is bounded staleness; the benefit is a hard ceiling on
+/// requests no matter how the widget is configured.
 ///
 /// Every refresh in between is answered from what is already on disk, stamped
 /// with when that reading was actually taken rather than when it was served.
 /// The widget refreshing more often than this costs nothing and asks nothing of
 /// Anthropic.
-pub(super) fn read(now: i64) -> Result<Reading, ProviderFailure> {
+pub(super) fn read(now: i64, poll_interval: i64) -> Result<Reading, ProviderFailure> {
     let cached = load_cache().filter(is_usable);
 
-    if let Some(cached) = cached.as_ref().filter(|cached| within_floor(cached, now)) {
+    if let Some(cached) = cached
+        .as_ref()
+        .filter(|cached| within_floor(cached, now, poll_interval))
+    {
         return replay(cached);
     }
 
@@ -138,8 +134,8 @@ fn is_usable(cached: &CachedUsage) -> bool {
     cached.schema_version == 1
 }
 
-fn within_floor(cached: &CachedUsage, now: i64) -> bool {
-    now.saturating_sub(cached.attempted_at) < POLL_INTERVAL
+fn within_floor(cached: &CachedUsage, now: i64, poll_interval: i64) -> bool {
+    now.saturating_sub(cached.attempted_at) < poll_interval
 }
 
 /// What to serve without asking the endpoint again.
@@ -363,6 +359,9 @@ fn window(value: Option<&Value>) -> Option<CapturedWindow> {
 mod tests {
     use super::*;
 
+    /// The value the setting defaults to, in the units the floor works in.
+    const DEFAULT_POLL_INTERVAL: i64 = crate::model::DEFAULT_CLAUDE_USAGE_POLL_SECONDS as i64;
+
     fn response() -> Value {
         // Trimmed from a real 200, keeping the shape and one window that is
         // null — which is how the endpoint reports a window that does not
@@ -402,18 +401,35 @@ mod tests {
     fn a_reading_inside_the_poll_interval_is_reused_rather_than_refetched() {
         // The widget refreshes every five minutes by default and can be set to
         // every minute. Neither may turn into a request.
-        assert!(within_floor(&cached(1_000), 1_000 + POLL_INTERVAL - 1));
+        assert!(within_floor(
+            &cached(1_000),
+            1_000 + DEFAULT_POLL_INTERVAL - 1,
+            DEFAULT_POLL_INTERVAL
+        ));
     }
 
     #[test]
     fn the_endpoint_is_asked_again_once_the_interval_has_passed() {
-        assert!(!within_floor(&cached(1_000), 1_000 + POLL_INTERVAL));
+        assert!(!within_floor(
+            &cached(1_000),
+            1_000 + DEFAULT_POLL_INTERVAL,
+            DEFAULT_POLL_INTERVAL
+        ));
     }
 
     #[test]
-    fn the_request_ceiling_holds_at_four_an_hour() {
+    fn the_floor_is_whatever_the_user_chose() {
+        // A one-minute setting asks again after a minute; a twenty-minute one
+        // waits the full twenty.
+        assert!(!within_floor(&cached(1_000), 1_060, 60));
+        assert!(within_floor(&cached(1_000), 1_060, 1_200));
+        assert!(!within_floor(&cached(1_000), 2_200, 1_200));
+    }
+
+    #[test]
+    fn the_default_request_ceiling_holds_at_six_an_hour() {
         // Stated in the README and worth failing a build over if it drifts.
-        assert_eq!(3_600 / POLL_INTERVAL, 4);
+        assert_eq!(3_600 / DEFAULT_POLL_INTERVAL, 6);
     }
 
     #[test]
@@ -423,8 +439,16 @@ mod tests {
         // interval and asked *more* often precisely when it should ask less.
         let attempt = failed_attempt(None, &refused(), 1_000);
 
-        assert!(within_floor(&attempt, 1_000 + POLL_INTERVAL - 1));
-        assert!(!within_floor(&attempt, 1_000 + POLL_INTERVAL));
+        assert!(within_floor(
+            &attempt,
+            1_000 + DEFAULT_POLL_INTERVAL - 1,
+            DEFAULT_POLL_INTERVAL
+        ));
+        assert!(!within_floor(
+            &attempt,
+            1_000 + DEFAULT_POLL_INTERVAL,
+            DEFAULT_POLL_INTERVAL
+        ));
     }
 
     #[test]

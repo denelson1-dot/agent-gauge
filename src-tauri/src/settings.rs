@@ -38,6 +38,7 @@ impl SettingsStore {
             update(&mut settings);
             settings.schema_version = SETTINGS_SCHEMA_VERSION;
             settings.refresh_interval_seconds = settings.refresh_interval_seconds.clamp(60, 3600);
+            settings.claude_usage_poll_seconds = settings.claude_usage_poll_seconds.clamp(60, 3600);
             settings.clone()
         };
         atomic_write_json(&self.path, &snapshot)?;
@@ -94,6 +95,19 @@ mod tests {
     fn default_refresh_interval_is_safe() {
         let settings = AppSettings::default();
         assert_eq!(settings.refresh_interval_seconds, 300);
+        assert_eq!(settings.claude_usage_poll_seconds, 600);
         assert_eq!(settings.schema_version, SETTINGS_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_settings_file_from_before_the_poll_setting_still_loads() {
+        // Older files lack the field. They must pick up the default rather
+        // than being quarantined, which would reset every other preference.
+        let bytes = format!(
+            r#"{{"schema_version":{SETTINGS_SCHEMA_VERSION},"refresh_interval_seconds":60}}"#
+        );
+        let settings: AppSettings = serde_json::from_str(&bytes).expect("older file parses");
+        assert_eq!(settings.refresh_interval_seconds, 60);
+        assert_eq!(settings.claude_usage_poll_seconds, 600);
     }
 }

@@ -4,6 +4,23 @@ All notable changes to Agent Gauge are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-09-01
+
+### Added
+
+- The Claude usage-endpoint poll interval is now a setting: *Backup usage
+  check* under Settings → Trackers, with options from one to twenty minutes.
+  It only governs the endpoint read that stands in while no terminal session
+  is feeding the status-line capture.
+
+### Changed
+
+- The default poll interval is ten minutes rather than fifteen — six requests
+  an hour at most. Reading usage still does not consume it.
+- A poll interval shorter than the widget's refresh interval is now honoured.
+  Previously the endpoint was only consulted on a widget refresh, so a shorter
+  floor could never be reached.
+
 ## [0.3.1] — 2026-08-30
 
 ### Fixed
@@ -68,6 +85,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ordering and enable/disable controls, saved geometry, start-at-login, and
   versioned custom-adapter manifests with hash-bound trust.
 
+[0.4.0]: https://github.com/denelson1-dot/agent-gauge/releases/tag/v0.4.0
 [0.3.1]: https://github.com/denelson1-dot/agent-gauge/releases/tag/v0.3.1
 [0.3.0]: https://github.com/denelson1-dot/agent-gauge/commit/70b4c31
 [0.2.0]: https://github.com/denelson1-dot/agent-gauge/commit/9c6e2f3
