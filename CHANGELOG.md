@@ -69,6 +69,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   versioned custom-adapter manifests with hash-bound trust.
 
 [0.3.1]: https://github.com/denelson1-dot/agent-gauge/releases/tag/v0.3.1
-[0.3.0]: https://github.com/denelson1-dot/agent-gauge/releases/tag/v0.3.0
+[0.3.0]: https://github.com/denelson1-dot/agent-gauge/commit/70b4c31
 [0.2.0]: https://github.com/denelson1-dot/agent-gauge/commit/9c6e2f3
 [0.1.4]: https://github.com/denelson1-dot/agent-gauge/commit/3e3f719
