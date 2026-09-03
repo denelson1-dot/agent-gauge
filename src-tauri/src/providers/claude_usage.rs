@@ -215,6 +215,51 @@ fn failed_attempt(
     }
 }
 
+/// Reset times the endpoint last reported, for a reading that has none of its
+/// own.
+///
+/// A reset timestamp is a wall-clock fact rather than a measurement: "the
+/// window turns over at 09:00" does not become less true because it was learned
+/// an hour ago. So it survives being paired with a fresher percentage from
+/// another source, which is what lets a desktop-app reading still show a
+/// countdown. Timestamps that have already passed are dropped — that window has
+/// since rolled over, and its next reset is not something this cache knows.
+///
+/// Deliberately does not consult the network or the poll floor: it only reads
+/// what is already on disk.
+pub(super) fn cached_resets(now: i64) -> ResetHints {
+    let cached = load_cache().filter(is_usable);
+    resets_from(
+        cached.as_ref().and_then(|cached| cached.five_hour.as_ref()),
+        cached.as_ref().and_then(|cached| cached.seven_day.as_ref()),
+        now,
+    )
+}
+
+/// The still-future reset times out of a pair of windows, whatever their age.
+pub(super) fn resets_from(
+    five_hour: Option<&CapturedWindow>,
+    seven_day: Option<&CapturedWindow>,
+    now: i64,
+) -> ResetHints {
+    let hint = |window: Option<&CapturedWindow>| {
+        window
+            .and_then(|window| window.resets_at)
+            .filter(|resets_at| *resets_at > now)
+    };
+    ResetHints {
+        five_hour: hint(five_hour),
+        seven_day: hint(seven_day),
+    }
+}
+
+/// Reset times still in the future, by window.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ResetHints {
+    pub(super) five_hour: Option<i64>,
+    pub(super) seven_day: Option<i64>,
+}
+
 fn load_cache() -> Option<CachedUsage> {
     let bytes = fs::read(paths::cache_dir().join(CACHE_FILE)).ok()?;
     serde_json::from_slice(&bytes).ok()

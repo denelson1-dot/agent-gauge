@@ -20,7 +20,7 @@ use crate::{
     settings::atomic_write_json,
 };
 
-use super::{claude_usage, now_unix, timestamp, ProviderFailure};
+use super::{claude_desktop, claude_usage, now_unix, timestamp, ProviderFailure};
 
 const CAPTURE_FILE: &str = "claude-capture.json";
 const INTEGRATION_FILE: &str = "claude-integration.json";
@@ -56,6 +56,7 @@ const CAPTURE_TRUSTED_FOR: i64 = 120;
 
 const FROM_CAPTURE: &str = "Captured from Claude Code";
 const FROM_ENDPOINT: &str = "Read from your Claude account";
+const FROM_DESKTOP: &str = "Read from the Claude desktop app";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct ClaudeCapture {
@@ -84,18 +85,36 @@ struct IntegrationMetadata {
 
 /// Claude usage, from whichever source can currently answer.
 ///
-/// The status-line capture is preferred while it is current: it costs nothing,
-/// needs no credentials and no network, and during an interactive session it is
-/// the freshest thing there is. It is also, on its own, incomplete — it exists
-/// only while a terminal is open, which left desktop-app users with a
-/// permanently empty gauge. `claude_usage` covers that gap.
+/// Three sources, in descending order of what they can tell us:
 ///
-/// A capture that has gone stale is still kept as the fallback for an endpoint
-/// that cannot answer. It carries its true age, and `UsageWindow::rolled_over`
-/// drops it outright once its window turns over, so an old reading is shown as
-/// old rather than mistaken for a current one.
+/// | Source          | Cost      | Needs            | Reset times |
+/// |-----------------|-----------|------------------|-------------|
+/// | status line     | none      | an open terminal | yes         |
+/// | usage endpoint  | a request | a valid sign-in  | yes         |
+/// | desktop history | none      | the desktop app  | no          |
+///
+/// Sources are ranked by *how current the reading is*, not by what they cost.
+/// Cheapest-first-wins would be the wrong rule: the two local sources are
+/// nearly always present, so preferring them on availability alone would
+/// permanently shadow the endpoint and with it every reset time the widget
+/// shows. Cost is already handled elsewhere — the endpoint enforces its own
+/// poll floor and answers from cache in between, so consulting it here is free
+/// except once per `poll_interval`.
+///
+/// 1. A status-line capture under [`CAPTURE_TRUSTED_FOR`]. A terminal is
+///    actively feeding us and a round trip would only confirm what we have.
+/// 2. The endpoint, which serves from its own cache while the floor holds.
+///    Note that an `Ok` from it may be a *replayed* reading rather than a
+///    current one, so it is still weighed against the desktop app's by age.
+/// 3. On failure, whichever fallback is freshest — a desktop reading up to an
+///    hour old, or a stale capture.
+///
+/// Every reading carries its true age, and `UsageWindow::rolled_over` discards
+/// a window that has since turned over, so an old reading reads as old rather
+/// than as current.
+///
 /// `poll_interval` is the user's floor on how often the usage endpoint may be
-/// asked; it has no bearing on the capture path.
+/// asked.
 pub fn read(poll_interval: i64) -> Result<ProviderSnapshot, ProviderFailure> {
     let now = now_unix();
     let capture = load_capture()?;
@@ -104,32 +123,103 @@ pub fn read(poll_interval: i64) -> Result<ProviderSnapshot, ProviderFailure> {
         return Ok(capture.snapshot(FROM_CAPTURE));
     }
 
+    let desktop = claude_desktop::read(now);
+
     match claude_usage::read(now, poll_interval) {
         Ok(reading) => {
-            let mut snapshot = snapshot(
-                reading.five_hour,
-                reading.seven_day,
-                reading.observed_at,
-                FROM_ENDPOINT,
-            );
+            let claude_usage::Reading {
+                five_hour,
+                seven_day,
+                observed_at,
+                warning,
+            } = reading;
+
+            // An `Ok` here is not necessarily a *current* reading: when the
+            // endpoint cannot be reached the cache is replayed rather than
+            // discarded, so this can be hours old while the desktop app has
+            // been quietly recording all along. Age decides between them, not
+            // which source answered — otherwise a permanently expired sign-in
+            // pins the widget to whatever it last saw, which is exactly how an
+            // idle window comes to read as a confident `0%`.
+            let hints = claude_usage::resets_from(five_hour.as_ref(), seven_day.as_ref(), now);
+            let fresher = desktop.filter(|reading| is_fresher(reading, Some(observed_at)));
+            let mut snapshot = match fresher {
+                Some(reading) => desktop_snapshot(&reading, hints),
+                None => snapshot(five_hour, seven_day, observed_at, FROM_ENDPOINT),
+            };
+
             // Numbers we still trust, next to the reason they have stopped
             // moving. The widget renders this as a warning rather than
             // replacing the reading with it.
-            if let Some(warning) = reading.warning {
+            if let Some(warning) = warning {
                 snapshot.status_message = warning.message;
                 snapshot.error_code = Some(warning.code);
             }
             Ok(snapshot)
         }
-        Err(failure) => match capture {
-            Some(capture) if capture.has_usage() => Ok(capture.snapshot(FROM_CAPTURE)),
+        Err(failure) => match fallback(capture, desktop, claude_usage::cached_resets(now)) {
+            Some(snapshot) => Ok(snapshot),
             // Never captured anything and no sign-in to read: a fresh install,
             // not a fault. Keep the onboarding wording rather than reporting an
             // error against something the user has not set up yet.
             None if failure.code == "oauth_missing" => Ok(waiting_snapshot()),
-            _ => Err(failure),
+            None => Err(failure),
         },
     }
+}
+
+/// The freshest reading available once the endpoint has declined to answer.
+///
+/// Ranked by observation time rather than by which source it came from. A
+/// desktop reading minutes old describes the current window; a capture from
+/// this morning does not, whatever else it carries. Reset times are not a
+/// reason to prefer the older of the two, because the newer one can borrow
+/// them — see [`claude_usage::cached_resets`].
+fn fallback(
+    capture: Option<ClaudeCapture>,
+    desktop: Option<claude_desktop::Reading>,
+    hints: claude_usage::ResetHints,
+) -> Option<ProviderSnapshot> {
+    let capture = capture.filter(|capture| capture.has_usage());
+    let capture_at = capture.as_ref().map(|capture| capture.observed_at);
+
+    match desktop.filter(|reading| is_fresher(reading, capture_at)) {
+        Some(reading) => Some(desktop_snapshot(&reading, hints)),
+        None => capture.map(|capture| capture.snapshot(FROM_CAPTURE)),
+    }
+}
+
+/// Whether a desktop reading describes a more recent moment than another
+/// source's, and so should be shown in its place.
+///
+/// The single rule behind both places the desktop app is weighed against
+/// something else. A tie goes to the other source: an endpoint or capture
+/// reading carries reset times of its own, which a desktop reading never does,
+/// so there is no reason to displace it without being genuinely newer.
+fn is_fresher(desktop: &claude_desktop::Reading, other: Option<i64>) -> bool {
+    // `None` sorts below `Some`, so a source with nothing to offer always
+    // loses rather than winning by default.
+    Some(desktop.observed_at) > other
+}
+
+/// A desktop reading, with any reset times the endpoint last knew filled in.
+fn desktop_snapshot(
+    reading: &claude_desktop::Reading,
+    hints: claude_usage::ResetHints,
+) -> ProviderSnapshot {
+    let fill = |window: Option<CapturedWindow>, resets_at: Option<i64>| {
+        window.map(|window| CapturedWindow {
+            resets_at: window.resets_at.or(resets_at),
+            ..window
+        })
+    };
+
+    snapshot(
+        fill(reading.five_hour.clone(), hints.five_hour),
+        fill(reading.seven_day.clone(), hints.seven_day),
+        reading.observed_at,
+        FROM_DESKTOP,
+    )
 }
 
 impl ClaudeCapture {
@@ -652,6 +742,140 @@ fn read_json(path: &Path) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const NOW: i64 = 1_788_361_363;
+
+    fn desktop_reading(
+        observed_at: i64,
+        five_hour: f64,
+        seven_day: f64,
+    ) -> claude_desktop::Reading {
+        claude_desktop::Reading {
+            five_hour: Some(CapturedWindow {
+                used_percent: five_hour,
+                resets_at: None,
+            }),
+            seven_day: Some(CapturedWindow {
+                used_percent: seven_day,
+                resets_at: None,
+            }),
+            observed_at,
+        }
+    }
+
+    fn stale_capture(observed_at: i64, five_hour: f64) -> ClaudeCapture {
+        ClaudeCapture {
+            schema_version: 1,
+            observed_at,
+            claude_version: None,
+            five_hour: Some(CapturedWindow {
+                used_percent: five_hour,
+                resets_at: Some(NOW + 600),
+            }),
+            seven_day: None,
+        }
+    }
+
+    fn hints(five_hour: Option<i64>, seven_day: Option<i64>) -> claude_usage::ResetHints {
+        claude_usage::ResetHints {
+            five_hour,
+            seven_day,
+        }
+    }
+
+    fn window<'a>(snapshot: &'a ProviderSnapshot, id: &str) -> &'a UsageWindow {
+        snapshot
+            .windows
+            .iter()
+            .find(|window| window.id == id)
+            .expect("the window should be present")
+    }
+
+    #[test]
+    fn the_freshest_fallback_wins_over_the_one_with_reset_times() {
+        // The bug that started this: a capture hours old kept being shown at a
+        // percentage its window had long since left behind, because it was the
+        // only source carrying a reset time. Reset times are borrowed instead.
+        let snapshot = fallback(
+            Some(stale_capture(NOW - 7 * 3_600, 0.0)),
+            Some(desktop_reading(NOW - 300, 13.0, 12.0)),
+            hints(None, None),
+        )
+        .expect("a fallback reading");
+
+        assert_eq!(snapshot.status_message, FROM_DESKTOP);
+        assert_eq!(snapshot.observed_at, Some(NOW - 300));
+        assert_eq!(window(&snapshot, "five-hour").used_percent, 13.0);
+    }
+
+    #[test]
+    fn a_desktop_reading_borrows_the_reset_times_the_endpoint_last_knew() {
+        let snapshot = fallback(
+            None,
+            Some(desktop_reading(NOW - 300, 13.0, 12.0)),
+            hints(Some(NOW + 600), Some(NOW + 90_000)),
+        )
+        .expect("a fallback reading");
+
+        assert_eq!(window(&snapshot, "five-hour").resets_at, Some(NOW + 600));
+        assert_eq!(window(&snapshot, "seven-day").resets_at, Some(NOW + 90_000));
+    }
+
+    #[test]
+    fn a_desktop_reading_without_hints_reports_no_reset_time() {
+        // Better an admitted gap than a guessed timestamp.
+        let snapshot = fallback(
+            None,
+            Some(desktop_reading(NOW - 300, 13.0, 12.0)),
+            hints(None, None),
+        )
+        .expect("a fallback reading");
+
+        assert_eq!(window(&snapshot, "five-hour").resets_at, None);
+    }
+
+    #[test]
+    fn a_fresher_capture_still_beats_a_desktop_reading() {
+        let snapshot = fallback(
+            Some(stale_capture(NOW - 300, 42.0)),
+            Some(desktop_reading(NOW - 3_000, 13.0, 12.0)),
+            hints(None, None),
+        )
+        .expect("a fallback reading");
+
+        assert_eq!(snapshot.status_message, FROM_CAPTURE);
+        assert_eq!(window(&snapshot, "five-hour").used_percent, 42.0);
+    }
+
+    #[test]
+    fn a_tie_goes_to_the_source_that_carries_reset_times() {
+        // Nothing is gained by displacing an equally recent reading with one
+        // that knows less.
+        let reading = desktop_reading(NOW - 300, 13.0, 12.0);
+
+        assert!(!is_fresher(&reading, Some(NOW - 300)));
+        assert!(is_fresher(&reading, Some(NOW - 301)));
+        assert!(!is_fresher(&reading, Some(NOW - 299)));
+    }
+
+    #[test]
+    fn a_desktop_reading_wins_when_there_is_nothing_to_compare_against() {
+        assert!(is_fresher(&desktop_reading(NOW - 3_000, 13.0, 12.0), None));
+    }
+
+    #[test]
+    fn a_capture_that_never_recorded_usage_is_not_a_fallback() {
+        let empty = ClaudeCapture {
+            schema_version: 1,
+            observed_at: NOW,
+            claude_version: None,
+            five_hour: None,
+            seven_day: None,
+        };
+
+        assert!(fallback(Some(empty), None, hints(None, None)).is_none());
+        assert!(fallback(None, None, hints(None, None)).is_none());
+    }
 
     #[test]
     fn extracts_only_documented_rate_limit_fields() {

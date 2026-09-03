@@ -4,6 +4,34 @@ All notable changes to Agent Gauge are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-09-02
+
+### Added
+
+- Claude usage now falls back to the desktop app's own record of plan usage
+  (`plan-usage-history.json`), which needs no terminal session, no request and
+  no credentials of Agent Gauge's own. This covers the case the endpoint could
+  not: Claude Code is what refreshes the sign-in token, so for anyone working
+  mainly in the desktop app it expires and stays expired.
+
+### Fixed
+
+- A reading the usage endpoint replayed from its cache is no longer shown in
+  preference to a fresher one from the desktop app. When the endpoint could not
+  be reached its last reading was replayed indefinitely, so an expired sign-in
+  pinned the widget to whatever it saw last — which is how a five-hour window
+  with no activity in it came to read as a confident `0%` hours after the fact.
+  Sources are now ranked by how current the reading is.
+- A window whose reset time is missing from the reading being shown now borrows
+  the one the endpoint last reported, provided it has not yet passed. A reset
+  timestamp does not stop being true because it was learned earlier, so the
+  weekly countdown survives a fallback instead of reading *Reset unavailable*.
+- The Linux widget now draws the reason a reading has stopped moving. The
+  message was produced for both renderers but only the Windows one drew it; on
+  Linux it merely tinted the status label red, so the card said *Stale* without
+  ever saying why, and the sentence explaining what to do was reachable only
+  through Settings → Trackers.
+
 ## [0.4.0] — 2026-09-01
 
 ### Added
@@ -85,6 +113,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ordering and enable/disable controls, saved geometry, start-at-login, and
   versioned custom-adapter manifests with hash-bound trust.
 
+[0.5.0]: https://github.com/denelson1-dot/agent-gauge/releases/tag/v0.5.0
 [0.4.0]: https://github.com/denelson1-dot/agent-gauge/releases/tag/v0.4.0
 [0.3.1]: https://github.com/denelson1-dot/agent-gauge/releases/tag/v0.3.1
 [0.3.0]: https://github.com/denelson1-dot/agent-gauge/commit/70b4c31

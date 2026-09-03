@@ -1,4 +1,5 @@
 mod claude;
+mod claude_desktop;
 mod claude_usage;
 mod codex;
 

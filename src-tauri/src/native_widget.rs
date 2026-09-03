@@ -21,6 +21,16 @@ mod linux {
 
     type Color = (f64, f64, f64, f64);
 
+    /// How many lines of a provider warning the card will show.
+    ///
+    /// Two covers every message the providers actually produce; the cap exists
+    /// for the one that embeds an arbitrary network error and so has no length
+    /// of its own. See [`wrap_lines`].
+    const WARNING_MAX_LINES: usize = 2;
+
+    /// Space above the warning, separating it from the metrics.
+    const WARNING_GAP: f64 = 10.0;
+
     #[derive(Clone, Copy)]
     struct Palette {
         surface: Color,
@@ -427,10 +437,35 @@ mod linux {
             .filter(|window| window.display == WindowDisplay::Bar)
             .collect();
         let has_balance = !provider.balances.is_empty();
+
+        // Measured before anything is positioned: a warning takes room from the
+        // same centred block as the metrics, so it has to be part of the height
+        // they are centred by. Drawing it afterwards without reserving the space
+        // would overlap whatever sits above it.
+        let warning_size = 9.0 * text_scale;
+        let warning_lines = provider
+            .warning
+            .as_deref()
+            .map(|warning| {
+                wrap_lines(
+                    context,
+                    warning,
+                    width - 32.0 * scale,
+                    warning_size,
+                    WARNING_MAX_LINES,
+                )
+            })
+            .unwrap_or_default();
+
         let ring_block = if ring.is_some() { 82.0 * scale } else { 0.0 };
         let bar_block = bars.len() as f64 * 44.0 * scale;
         let balance_block = if has_balance { 29.0 * scale } else { 0.0 };
-        let block_height = ring_block + bar_block + balance_block;
+        let warning_block = if warning_lines.is_empty() {
+            0.0
+        } else {
+            WARNING_GAP * scale + warning_lines.len() as f64 * leading(warning_size)
+        };
+        let block_height = ring_block + bar_block + balance_block + warning_block;
         let content_top = y + 43.0 * scale;
         let content_bottom = y + height - 11.0 * scale;
         let mut cursor = content_top + (content_bottom - content_top - block_height).max(0.0) / 2.0;
@@ -511,6 +546,23 @@ mod linux {
                 10.5 * text_scale,
                 FontWeight::Bold,
                 colors.text,
+            );
+            cursor += balance_block;
+        }
+
+        // The reason a reading has stopped moving, in the provider's own words.
+        // Previously this only tinted the status label, which named the state
+        // ("Stale") but never the cause — leaving the one sentence that says
+        // what to do about it visible in Settings and nowhere else.
+        for (index, line) in warning_lines.iter().enumerate() {
+            label(
+                context,
+                line,
+                x + 16.0 * scale,
+                cursor + WARNING_GAP * scale + warning_size + index as f64 * leading(warning_size),
+                warning_size,
+                FontWeight::Normal,
+                colors.error,
             );
         }
     }
@@ -806,30 +858,166 @@ mod linux {
         size: f64,
         color: Color,
     ) {
+        for (index, line) in wrap_lines(context, value, max_width, size, usize::MAX)
+            .iter()
+            .enumerate()
+        {
+            let line_y = y + index as f64 * leading(size);
+            label(context, line, x, line_y, size, FontWeight::Normal, color);
+        }
+    }
+
+    /// The baseline-to-baseline distance for wrapped text at `size`.
+    ///
+    /// Shared so that code reserving vertical space and code drawing into it
+    /// cannot disagree about how tall the result is.
+    fn leading(size: f64) -> f64 {
+        size + 4.0
+    }
+
+    /// Breaks `value` into lines that fit `max_width`, to at most `max_lines`.
+    ///
+    /// Returning the lines rather than drawing them is what lets a caller
+    /// measure a block before laying it out. When the text does not fit in
+    /// `max_lines` the final line is ellipsized, so a message cut short reads
+    /// as cut short instead of simply ending mid-sentence — the failure
+    /// messages this renders include one that embeds an arbitrary network
+    /// error, so some bound is required.
+    fn wrap_lines(
+        context: &Context,
+        value: &str,
+        max_width: f64,
+        size: f64,
+        max_lines: usize,
+    ) -> Vec<String> {
+        context.select_font_face("Sans", FontSlant::Normal, FontWeight::Normal);
+        context.set_font_size(size);
+        let measure = |text: &str| {
+            context
+                .text_extents(text)
+                .map(|extents| extents.x_advance())
+                .unwrap_or(0.0)
+        };
+
+        let mut lines: Vec<String> = Vec::new();
         let mut line = String::new();
-        let mut line_y = y;
         for word in value.split_whitespace() {
             let candidate = if line.is_empty() {
                 word.to_string()
             } else {
                 format!("{line} {word}")
             };
-            context.select_font_face("Sans", FontSlant::Normal, FontWeight::Normal);
-            context.set_font_size(size);
-            let width = context
-                .text_extents(&candidate)
-                .map(|extents| extents.x_advance())
-                .unwrap_or(0.0);
-            if width > max_width && !line.is_empty() {
-                label(context, &line, x, line_y, size, FontWeight::Normal, color);
+            if measure(&candidate) > max_width && !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+                if lines.len() == max_lines {
+                    if let Some(last) = lines.last_mut() {
+                        *last = ellipsize(&measure, last, max_width);
+                    }
+                    return lines;
+                }
                 line = word.to_string();
-                line_y += size + 4.0;
             } else {
                 line = candidate;
             }
         }
         if !line.is_empty() {
-            label(context, &line, x, line_y, size, FontWeight::Normal, color);
+            lines.push(line);
+        }
+        lines
+    }
+
+    /// Appends an ellipsis, dropping trailing words until it fits.
+    ///
+    /// The last word always survives even if it overflows, so the result is
+    /// never an ellipsis on its own.
+    fn ellipsize(measure: &impl Fn(&str) -> f64, line: &str, max_width: f64) -> String {
+        let mut words: Vec<&str> = line.split_whitespace().collect();
+        loop {
+            let candidate = format!("{}…", words.join(" "));
+            if words.len() <= 1 || measure(&candidate) <= max_width {
+                return candidate;
+            }
+            words.pop();
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Text measurement needs a Cairo context, but not a display: an
+        /// off-screen surface measures identically to the widget's own.
+        fn context() -> Context {
+            let surface =
+                gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 400, 200).unwrap();
+            Context::new(&surface).unwrap()
+        }
+
+        #[test]
+        fn short_text_stays_on_one_line() {
+            let lines = wrap_lines(&context(), "Stale", 300.0, 9.0, WARNING_MAX_LINES);
+
+            assert_eq!(lines, vec!["Stale".to_string()]);
+        }
+
+        #[test]
+        fn text_is_wrapped_within_the_width_it_is_given() {
+            let context = context();
+            let lines = wrap_lines(
+                &context,
+                "Claude sign-in has expired; open Claude Code once to refresh it",
+                120.0,
+                9.0,
+                WARNING_MAX_LINES,
+            );
+
+            context.set_font_size(9.0);
+            for line in &lines {
+                let width = context.text_extents(line).unwrap().x_advance();
+                assert!(width <= 120.0, "{line:?} overflows at {width}");
+            }
+        }
+
+        #[test]
+        fn an_overlong_message_is_capped_and_marked_as_cut_short() {
+            // The bound that keeps a card's layout predictable: one failure
+            // message embeds an arbitrary network error and has no length of
+            // its own.
+            let lines = wrap_lines(
+                &context(),
+                "Could not reach Claude for usage: dns error: failed to look up \
+                 the address information for the host after several attempts",
+                120.0,
+                9.0,
+                WARNING_MAX_LINES,
+            );
+
+            assert_eq!(lines.len(), WARNING_MAX_LINES);
+            assert!(
+                lines.last().expect("a final line").ends_with('…'),
+                "a truncated message should read as truncated: {lines:?}"
+            );
+        }
+
+        #[test]
+        fn a_single_word_too_long_to_fit_is_kept_rather_than_reduced_to_dots() {
+            let lines = wrap_lines(
+                &context(),
+                "https://api.anthropic.com/api/oauth/usage/an/extremely/long/path",
+                40.0,
+                9.0,
+                1,
+            );
+
+            assert_eq!(lines.len(), 1);
+            assert!(lines[0].len() > 1, "{lines:?}");
+        }
+
+        #[test]
+        fn reserved_height_matches_what_the_lines_will_occupy() {
+            // The invariant the warning block depends on: measure and draw
+            // must agree, or the text lands on top of the metrics.
+            assert_eq!(leading(9.0), 13.0);
+            assert_eq!(leading(10.0), 14.0);
         }
     }
 }

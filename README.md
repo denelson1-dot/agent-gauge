@@ -12,7 +12,7 @@
   <img src="docs/images/hero.png" alt="Agent Gauge sitting on the desktop, showing Codex and Claude usage" width="440">
 </p>
 
-Agent Gauge runs on Linux and Windows. It reads the local Codex CLI, a reversible Claude Code status-line feed, and — when no terminal session is feeding that feed — Claude's own usage endpoint, using the sign-in Claude Code already holds.
+Agent Gauge runs on Linux and Windows. It reads the local Codex CLI, a reversible Claude Code status-line feed, and — when no terminal session is feeding that feed — Claude's own usage endpoint, using the sign-in Claude Code already holds, falling back to the Claude desktop app's own usage record when that sign-in has expired.
 
 It does **not** scrape provider websites, make model calls, store or transmit your credentials anywhere but back to the provider that issued them, send telemetry, or run a hosted service. Reading your usage does not consume it.
 
@@ -131,6 +131,14 @@ When a capture is more than two minutes old, Agent Gauge reads the same usage en
 That endpoint is asked at most **once every 10 minutes by default — six requests an hour, and only while no terminal session is running**. The interval is yours to set under Settings → Trackers → *Backup usage check*, anywhere from one to twenty minutes. Refreshes in between are answered from the last reading, shown with the time it was actually taken. The interval is measured from the last attempt rather than the last success, so a rate-limited or rejected request is not retried any faster than a working one; the numbers stay on screen with a note saying why they have stopped moving. The widget's refresh interval controls how often the display is brought up to date, not how often a request is made, so turning it down to a minute does not turn the request rate up. Reading your usage does not consume it: this is a metering endpoint, not an inference call, and it does not touch the five-hour or weekly windows it reports.
 
 Your credentials are read, never written. Refreshing an expired sign-in is Claude Code's job, not Agent Gauge's: attempting it here could invalidate the token Claude Code is holding and sign you out of your own editor. If the sign-in has expired, the gauge says so and opening Claude Code once repairs it.
+
+### When the sign-in has expired too
+
+Claude Code is what refreshes that sign-in, so if you work mainly in the desktop app it eventually expires and stays expired. Rather than pin the gauge to the last reading it managed to take, Agent Gauge falls back to the desktop app's own record of your plan usage, which it keeps at `~/.config/Claude/plan-usage-history.json` (`%APPDATA%\Claude\plan-usage-history.json` on Windows). That file is read, never written; it costs no request and needs no credentials, and while the desktop app is running it is updated every few minutes.
+
+It records the two percentages but not when the windows reset, so a fallback reading reuses the reset times the endpoint last reported, and shows *Reset unavailable* for a window it has none for rather than guessing one.
+
+Sources are ranked by how current the reading is, not by what they cost, and every reading is shown with the time it was actually taken.
 
 While you are working in a terminal, the status-line capture answers on its own and no request is made.
 

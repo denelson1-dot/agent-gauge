@@ -27,6 +27,10 @@ use std::{
 const APP_DIR: &str = "agent-gauge";
 
 struct Base {
+    /// The platform's application-data root, *without* Agent Gauge's own
+    /// subdirectory. Needed because other applications' data is resolved
+    /// against the same root — see `paths::claude_desktop_history_path`.
+    config_base: PathBuf,
     config: PathBuf,
     cache: PathBuf,
     state: PathBuf,
@@ -48,6 +52,14 @@ pub fn init() -> Result<(), String> {
 
 pub fn config_dir() -> PathBuf {
     base().config.clone()
+}
+
+/// The application-data root that [`config_dir`] is built on.
+///
+/// Exposed only so that another application's directory can be resolved
+/// alongside our own. Agent Gauge's own files always go under `config_dir`.
+pub fn config_base() -> PathBuf {
+    base().config_base.clone()
 }
 
 pub fn cache_dir() -> PathBuf {
@@ -82,8 +94,11 @@ fn resolve() -> Result<Base, String> {
         "HOME is not set, so Agent Gauge cannot tell where your home directory is".to_string()
     })?;
 
+    let config_base = xdg_dir("XDG_CONFIG_HOME", &home, ".config");
+
     Ok(Base {
-        config: xdg_dir("XDG_CONFIG_HOME", &home, ".config").join(APP_DIR),
+        config: config_base.join(APP_DIR),
+        config_base,
         cache: xdg_dir("XDG_CACHE_HOME", &home, ".cache").join(APP_DIR),
         state: xdg_dir("XDG_STATE_HOME", &home, ".local/state").join(APP_DIR),
         home,
@@ -110,6 +125,7 @@ fn resolve() -> Result<Base, String> {
 
     Ok(Base {
         config: roaming.join(APP_DIR),
+        config_base: roaming,
         cache: local.join("cache"),
         state: local.join("state"),
         home,
