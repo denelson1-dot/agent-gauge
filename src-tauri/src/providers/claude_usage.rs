@@ -121,11 +121,21 @@ pub(super) fn read(now: i64, poll_interval: i64) -> Result<Reading, ProviderFail
             let kept = cached.filter(|cached| cached.has_reading());
             store(&failed_attempt(kept.as_ref(), &failure, now));
             match kept {
-                Some(cached) => Ok(cached.into_reading(Some(failure))),
+                Some(cached) => Ok(cached.into_reading(warning_from(failure))),
                 None => Err(failure),
             }
         }
     }
+}
+
+/// The failure worth saying out loud beside numbers we can still show.
+///
+/// A token waiting on Claude Code's next run is not one: the reading has only
+/// stopped moving, and the status label says so already. Naming a sign-in that
+/// has not actually lapsed turns a self-healing condition into a fault the user
+/// is asked to fix.
+fn warning_from(failure: ProviderFailure) -> Option<ProviderFailure> {
+    (failure.code != "oauth_stale").then_some(failure)
 }
 
 /// A cache this build knows how to read. An unknown schema is discarded rather
@@ -141,7 +151,9 @@ fn within_floor(cached: &CachedUsage, now: i64, poll_interval: i64) -> bool {
 /// What to serve without asking the endpoint again.
 fn replay(cached: &CachedUsage) -> Result<Reading, ProviderFailure> {
     match (cached.has_reading(), cached.failure.as_ref()) {
-        (true, failure) => Ok(cached.clone().into_reading(failure.map(Into::into))),
+        (true, failure) => Ok(cached
+            .clone()
+            .into_reading(failure.map(Into::into).and_then(warning_from))),
         (false, Some(failure)) => Err(failure.into()),
         (false, None) => Err(ProviderFailure::disconnected(
             "usage_unavailable",
@@ -315,10 +327,7 @@ fn access_token(now: i64) -> Result<String, ProviderFailure> {
     // Milliseconds, unlike every other timestamp either source reports.
     if let Some(expires_at) = oauth.get("expiresAt").and_then(Value::as_i64) {
         if expires_at / 1_000 <= now {
-            return Err(ProviderFailure::disconnected(
-                "oauth_expired",
-                "Claude sign-in has expired; open Claude Code once to refresh it",
-            ));
+            return Err(expiry_failure(oauth, now));
         }
     }
 
@@ -333,6 +342,41 @@ fn access_token(now: i64) -> Result<String, ProviderFailure> {
                 "Sign in to Claude Code to read usage without a terminal session",
             )
         })
+}
+
+/// What an expired access token actually means, which is usually very little.
+///
+/// That token lives about eight hours and is refreshed the next time Claude
+/// Code itself runs, so finding an expired one says nothing about whether the
+/// user is signed in: a day spent in the desktop app, or a terminal left idle
+/// overnight, produces one. Reporting that as a lapsed sign-in sent people to
+/// repair something that was never broken. It is `oauth_stale` instead — the
+/// numbers have simply stopped being refreshed, which the widget already says
+/// by marking the reading stale.
+///
+/// A refresh token that has itself expired is the other case, and there the
+/// user really is signed out with something to do about it.
+fn expiry_failure(oauth: &Value, now: i64) -> ProviderFailure {
+    let refreshable = oauth
+        .get("refreshToken")
+        .and_then(Value::as_str)
+        .is_some_and(|token| !token.is_empty())
+        && oauth
+            .get("refreshTokenExpiresAt")
+            .and_then(Value::as_i64)
+            .is_none_or(|expires_at| expires_at / 1_000 > now);
+
+    if refreshable {
+        ProviderFailure::disconnected(
+            "oauth_stale",
+            "Claude Code has not refreshed its usage token; run it once for current numbers",
+        )
+    } else {
+        ProviderFailure::disconnected(
+            "oauth_expired",
+            "Claude sign-in has expired; sign in to Claude Code again",
+        )
+    }
 }
 
 fn get(token: &str) -> Result<Value, ProviderFailure> {
@@ -440,6 +484,66 @@ mod tests {
 
     fn refused() -> ProviderFailure {
         ProviderFailure::disconnected("oauth_expired", "Claude sign-in has expired")
+    }
+
+    fn stale_token() -> ProviderFailure {
+        ProviderFailure::disconnected("oauth_stale", "Claude Code has not refreshed its token")
+    }
+
+    fn oauth(expires_at_ms: i64, refresh: Option<i64>) -> Value {
+        let mut oauth = serde_json::json!({
+            "accessToken": "token",
+            "expiresAt": expires_at_ms,
+        });
+        if let Some(refresh_expires_at_ms) = refresh {
+            oauth["refreshToken"] = "refresh".into();
+            oauth["refreshTokenExpiresAt"] = refresh_expires_at_ms.into();
+        }
+        oauth
+    }
+
+    #[test]
+    fn an_expired_access_token_with_a_live_refresh_is_not_a_lapsed_sign_in() {
+        // The common case by far: a day in the desktop app, or an idle
+        // terminal, and the eight-hour token ages out with the sign-in intact.
+        let failure = expiry_failure(&oauth(1_000_000, Some(9_000_000)), 2_000);
+
+        assert_eq!(failure.code, "oauth_stale");
+    }
+
+    #[test]
+    fn an_expired_refresh_token_is_reported_as_a_lapsed_sign_in() {
+        let failure = expiry_failure(&oauth(1_000_000, Some(1_500_000)), 2_000);
+
+        assert_eq!(failure.code, "oauth_expired");
+    }
+
+    #[test]
+    fn credentials_with_no_refresh_token_are_reported_as_a_lapsed_sign_in() {
+        let failure = expiry_failure(&oauth(1_000_000, None), 2_000);
+
+        assert_eq!(failure.code, "oauth_expired");
+    }
+
+    #[test]
+    fn a_token_awaiting_a_refresh_shows_the_numbers_without_calling_it_a_fault() {
+        // The reading is stale, and the status label says so. Adding a sign-in
+        // warning on top of it names a problem the user does not have.
+        let attempt = failed_attempt(Some(&cached(1_000)), &stale_token(), 2_000);
+
+        let reading = replay(&attempt).expect("an earlier reading should still be served");
+
+        assert_eq!(reading.five_hour.unwrap().used_percent, 11.0);
+        assert!(reading.warning.is_none(), "staleness is not a warning");
+    }
+
+    #[test]
+    fn a_token_awaiting_a_refresh_with_nothing_to_show_still_says_what_to_do() {
+        let attempt = failed_attempt(None, &stale_token(), 1_000);
+
+        let failure = replay(&attempt).expect_err("there is nothing to show");
+
+        assert_eq!(failure.code, "oauth_stale");
     }
 
     #[test]

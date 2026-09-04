@@ -4,6 +4,24 @@ All notable changes to Agent Gauge are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- An expired Claude Code access token is no longer reported as an expired
+  sign-in. That token lasts about eight hours and Claude Code refreshes it on
+  its next run, so a day spent in the desktop app produces one with the sign-in
+  perfectly intact — and the widget told those users to go repair something that
+  was not broken. The reading is now simply marked stale, which is what it is,
+  and the sign-in warning is kept for the case that warrants it: a refresh token
+  that has expired too.
+
+### Changed
+
+- A reading that has aged past the staleness threshold is now labelled *Cached*
+  rather than *Stale*. It is the last reading taken, not a broken one, and the
+  usual reason for it repairs itself.
+
 ## [0.5.0] — 2026-09-02
 
 ### Added

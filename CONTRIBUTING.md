@@ -19,7 +19,7 @@ Open an issue with:
 - your platform and version (Linux distribution and desktop environment, or
   Windows version), and the Agent Gauge version from **Settings → Diagnostics**;
 - what you expected and what happened instead;
-- whether the gauge showed a status such as `Stale`, `Expired`, or an error.
+- whether the gauge showed a status such as `Cached`, `Expired`, or an error.
 
 For anything about *where* the widget sits or *how* it is layered, the
 application can tell you what the window system actually did rather than what it

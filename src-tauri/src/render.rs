@@ -227,7 +227,10 @@ fn status_label(provider: &ProviderSnapshot, now: i64) -> String {
         return "Refreshing".into();
     }
     match provider.state {
-        ConnectionState::Connected if is_stale(provider, now) => "Stale".into(),
+        // "Cached" rather than "Stale": the reading is the last one taken, not
+        // a broken one, and the usual reason for it — a token waiting on Claude
+        // Code's next run — repairs itself without the user doing anything.
+        ConnectionState::Connected if is_stale(provider, now) => "Cached".into(),
         ConnectionState::Connected => "Connected".into(),
         ConnectionState::Waiting => "Waiting".into(),
         ConnectionState::Disconnected => "Disconnected".into(),
@@ -395,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_reading_is_labelled_as_stale() {
+    fn a_stale_reading_is_labelled_as_cached() {
         let fresh = provider(ConnectionState::Connected, Some(NOW - 60));
         let stale = provider(
             ConnectionState::Connected,
@@ -404,7 +407,7 @@ mod tests {
 
         assert_eq!(status_label(&fresh, NOW), "Connected");
         assert_eq!(status_tone(&fresh, NOW), StatusTone::Fresh);
-        assert_eq!(status_label(&stale, NOW), "Stale");
+        assert_eq!(status_label(&stale, NOW), "Cached");
         assert_eq!(status_tone(&stale, NOW), StatusTone::Stale);
     }
 

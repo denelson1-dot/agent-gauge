@@ -964,7 +964,7 @@ mod linux {
             let context = context();
             let lines = wrap_lines(
                 &context,
-                "Claude sign-in has expired; open Claude Code once to refresh it",
+                "Claude sign-in has expired; sign in to Claude Code again",
                 120.0,
                 9.0,
                 WARNING_MAX_LINES,
